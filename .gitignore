@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# Metal shader intermediates (AOT build artifacts)
+*.air
+*.metallib
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+*.swp
+*~
+
+# Training outputs
+*.png
+*.ply
+
+# Reference repos (not part of Metal-GS)
+mlx-splat/
+OpenSplat/
+
+# COLMAP data (large binary files)
+minGS/data/
+
+# minGS CUDA submodules (not needed for Metal-GS)
+minGS/submodules/
+minGS/.devcontainer/

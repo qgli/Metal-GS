@@ -1,0 +1,569 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║        Metal-GS: 反向传播架构设计草案 (Backward Pass Design)        ║
+║                                                                      ║
+║        目标：在 Metal 上实现可微高斯溅射渲染的梯度计算，               ║
+║        接入 PyTorch autograd.Function，使 Mac 上的 3DGS 训练成为可能  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+最后更新: 2026-02-21
+状态: 架构草案 (待实现)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 概述：为什么反向传播比前向复杂数倍？
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+前向管线是 "一对多" 映射：每个高斯球影响多个像素。
+反向传播是 "多对一" 聚合：每个像素的误差需要回传给它所影响的所有高斯球。
+
+这意味着：
+  ● 前向：每个像素的颜色 = Σ(高斯球贡献)，每个高斯球只写自己的输出
+  ● 反向：每个高斯球的梯度 = Σ(像素误差的贡献)，多个像素同时写同一个高斯球
+
+"多个像素写同一个高斯球" = 高并发写冲突 = 反向的核心难题
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2. 梯度链全图 (Gradient Chain — 从 Loss 到 3D 参数)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Loss = Σ_pixels || C_rendered - C_gt ||²
+
+梯度从损失函数出发，经过 4 个 backward kernel 逐级回传：
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │  dL/dC_pixel   (来自 loss 函数，维度 [H, W, 3])                │
+  │       │                                                         │
+  │       ▼                                                         │
+  │  ╔═══════════════════════════════════════════╗                   │
+  │  ║  Kernel A: rasterize_backward             ║                   │
+  │  ║  (逆序遍历 alpha blending)                ║                   │
+  │  ║                                           ║                   │
+  │  ║  输入: dL/dC_pixel, 前向保存的状态        ║                   │
+  │  ║  输出: dL/d_rgb      [N, 3]              ║                   │
+  │  ║        dL/d_opacity  [N]                 ║                   │
+  │  ║        dL/d_cov2d    [N, 3]  (conic)     ║                   │
+  │  ║        dL/d_mean2d   [N, 2]              ║                   │
+  │  ╚═══════════════════════════════════════════╝                   │
+  │       │                                                         │
+  │       ▼                                                         │
+  │  ╔═══════════════════════════════════════════╗                   │
+  │  ║  Kernel B: preprocess_backward            ║                   │
+  │  ║  (投影 Jacobian 转置 + EWA 反传)          ║                   │
+  │  ║                                           ║                   │
+  │  ║  输入: dL/d_cov2d, dL/d_mean2d           ║                   │
+  │  ║  输出: dL/d_cov3d    [N, 6]              ║                   │
+  │  ║        dL/d_mean3d   [N, 3]              ║                   │
+  │  ╚═══════════════════════════════════════════╝                   │
+  │       │                                                         │
+  │       ├──────────────────┐                                      │
+  │       ▼                  ▼                                      │
+  │  ╔═════════════════╗  ╔═════════════════════════╗               │
+  │  ║ Kernel C:       ║  ║ Kernel D:               ║               │
+  │  ║ cov3d_backward  ║  ║ sh_backward             ║               │
+  │  ║                 ║  ║                         ║               │
+  │  ║ dL/d_cov3d     ║  ║ dL/d_rgb → dL/d_sh     ║               │
+  │  ║    ↓            ║  ║         → dL/d_mean3d  ║               │
+  │  ║ dL/d_scales    ║  ║ (视线方向依赖均值)      ║               │
+  │  ║ dL/d_quats     ║  ║                         ║               │
+  │  ╚═════════════════╝  ╚═════════════════════════╝               │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+最终需要的梯度 (用于优化器):
+  ● dL/d_means3d   [N, 3]  — 高斯球 3D 位置
+  ● dL/d_scales    [N, 3]  — 各轴缩放因子
+  ● dL/d_quats     [N, 4]  — 旋转四元数
+  ● dL/d_sh_coeffs [N, K, 3] — SH 球谐系数
+  ● dL/d_opacities [N]     — 不透明度
+
+注意：dL/d_mean3d 有 **三个来源** 需要累加:
+  1) preprocess_backward: 投影 Jacobian 的反传
+  2) preprocess_backward: EWA cov2d 反传中 Jacobian 对 (tx,ty,tz) 的依赖
+  3) sh_backward: 视线方向 d = normalize(mean - campos) 对 mean 的依赖
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3. Kernel A: rasterize_backward — 逆序 Alpha Blending 求导
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3.1 数学推导
+─────────────
+
+前向 alpha blending (对于像素 p 的第 i 个高斯球):
+
+    C_p = Σ_i (c_i · α_i · T_i) + T_N · C_bg
+
+其中:
+    T_i = Π_{j<i} (1 - α_j)     (累积透射率)
+    α_i = min(0.999, o_i · G_i)  (G_i = exp(-σ_i/2), σ_i = Mahalanobis 距离)
+
+反向求导（对第 i 个高斯球在像素 p 上的贡献）:
+
+    ∂L/∂c_i = α_i · T_i · (∂L/∂C_p)
+
+    ∂L/∂α_i = T_i · [(c_i - C_rest/(1-α_i)) · (∂L/∂C_p)]
+
+    其中 C_rest = 从第 i+1 个高斯球到最后的累积颜色 + T_N·bg
+
+    化简为实用公式 (gsplat 风格):
+
+    令 v_alpha = (c_i · T_i - S_i·T_i/(1-α_i)) · ∂L/∂C_p
+                - T_final/(1-α_i) · bg · ∂L/∂C_p
+
+    其中 S_i 通过逆序遍历在线维护:
+        S_N = bg · T_N           (最后一个)
+        S_i = S_{i+1} + c_{i+1} · α_{i+1} · T_{i+1}   (逆序累加)
+
+    实际实现中更常用的等价形式:
+    维护 accum = Σ_{j>i} c_j · α_j · T_j
+    T_i 通过除法恢复: T_i = T_{i+1} / (1 - α_i)
+
+    然后:
+        dL/dα = T_i · (c_i · ∂L/∂C - 1/(1-α_i) · accum · ∂L/∂C)
+
+3.2 从 α 到下游梯度
+─────────────────────
+
+    α_i = o_i · exp(-σ_i/2),  σ_i = Δ^T Σ^{-1} Δ
+
+    ∂L/∂σ_i = ∂L/∂α_i · (-o_i · exp(-σ_i/2) · 0.5)
+             = ∂L/∂α_i · (-α_i / 2)          (当 α 未被 clamp 时)
+
+    ∂L/∂o_i = ∂L/∂α_i · exp(-σ_i/2)
+            = ∂L/∂α_i · (α_i / o_i)           (G_i = α_i / o_i)
+
+    ∂L/∂(Σ^{-1}_{xx}) = ∂L/∂σ · Δx²     (Mahalanobis → conic 梯度)
+    ∂L/∂(Σ^{-1}_{xy}) = ∂L/∂σ · Δx·Δy
+    ∂L/∂(Σ^{-1}_{yy}) = ∂L/∂σ · Δy²
+
+    ∂L/∂μ_x = ∂L/∂σ · (Σ^{-1}_{xx}·Δx + Σ^{-1}_{xy}·Δy)  (× -2)
+    ∂L/∂μ_y = ∂L/∂σ · (Σ^{-1}_{xy}·Δx + Σ^{-1}_{yy}·Δy)  (× -2)
+
+3.3 Kernel 架构
+─────────────────
+
+与前向相同：每个 Threadgroup (16×16) 处理一个 Tile。
+**关键区别**: 高斯球按 **逆深度顺序** 遍历 (从远到近)。
+
+前向需要保存 (save for backward):
+  ● T_final[H, W]  — 每像素的最终透射率
+  ● n_contrib[H, W] — 每像素参与混合的最后一个高斯球的索引
+    (用于精确恢复逆序遍历的终止点)
+
+Threadgroup 共享内存 (同前向，但逆序加载):
+  SharedGaussian[256] — 批量加载高斯球参数
+
+3.4 前向保存策略
+─────────────────
+
+方案 A (Inria 风格): 保存 final_T + final_idx
+  ● 优点: 最小额外显存 (H×W×8 bytes)
+  ● 逆序恢复 T_i: T_{i} = T_{i+1} / (1 - α_i) ← 需要重新计算 α_i
+
+方案 B (gsplat 风格): 同 A，但用 accum_color 替代 S
+  ● 优点: 数值更稳定，避免 1/(1-α) 在 α→1 时爆炸
+
+推荐: **方案 B** — 在 α 接近 1 时更鲁棒。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4. Kernel B: preprocess_backward — 投影 Jacobian 转置
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4.1 Conic → Cov2D 反传
+────────────────────────
+
+前向: conic (Σ^{-1}) = inverse(Σ_{2D})
+
+VJP (矩阵逆的导数):
+    dL/dΣ_{2D} = -Σ^{-1} · dL/dΣ^{-1} · Σ^{-1}
+
+展开为 2×2:
+    X = [[a, b], [b, c]]   (conic)
+    G = [[g_a, g_b], [g_b, g_c]]   (dL/d_conic)
+
+    dL/d_cov2d = -X · G · X
+
+    dL/da = -(a²·g_a + 2ab·g_b + b²·g_c)
+    dL/db = -(ab·g_a + (ac+b²)·g_b + bc·g_c)
+    dL/dc = -(b²·g_a + 2bc·g_b + c²·g_c)
+
+4.2 Cov2D → Cov3D + mean3d 反传
+──────────────────────────────────
+
+前向: Σ_{2D} = T · Σ_{3D} · T^T + blur·I
+       T = J · W   (2×3 effective, 第三行为零)
+       J = perspective Jacobian, W = view rotation
+
+VJP:
+    dL/dΣ_{3D} = T^T · dL/dΣ_{2D} · T
+
+    dL/dT = dL/dΣ_{2D} · T · Σ_{3D}^T + dL/dΣ_{2D}^T · T · Σ_{3D}
+           (利用对称性简化)
+
+    dL/dJ = dL/dT · W^T
+
+    Jacobian J 依赖于 (t_x, t_y, t_z) = clamped camera-space position:
+        J = [[fx/z,    0,   -fx·tx/z²],
+             [0,    fy/z,   -fy·ty/z²],
+             [0,       0,          0  ]]
+
+    dL/dt_x = -fx/z² · (dL/dJ)_{20}     (Jacobian 第 3 列第 1 行)
+    dL/dt_y = -fy/z² · (dL/dJ)_{21}
+    dL/dt_z = -fx/z² · (dL/dJ)_{00} + 2·fx·tx/z³ · (dL/dJ)_{20}
+              -fy/z² · (dL/dJ)_{11} + 2·fy·ty/z³ · (dL/dJ)_{21}
+
+    dL/d_mean3d += W^T · dL/dt    (视图变换的反传)
+
+    FOV 钳位: 如果 tx 或 ty 被 clamp 到 ±1.3·tan_fov，
+             则对应方向的梯度置零 (Inria 做法)。
+
+4.3 一对一映射 — 无原子冲突
+────────────────────────────
+
+preprocess_backward 中每个线程处理一个高斯球。
+输入 dL/d_cov2d[i] 和 dL/d_mean2d[i] 已经是逐高斯球的聚合梯度
+(由 rasterize_backward 通过原子加法累加完成)。
+因此 preprocess_backward **不需要原子操作**。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5. Kernel C: cov3d_backward — 从 Σ3D 到 scale/quaternion
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+前向: Σ_{3D} = M · M^T,  M = R · diag(s)
+
+VJP:
+    dL/dM = 2 · M · dL/dΣ_{3D}     (利用 Σ = MM^T 的导数)
+
+    dL/ds_i = R_i^T · dL/dM_i       (第 i 列的点积)
+            = Σ_k R_{ki} · (dL/dM)_{ki}
+
+    dL/dR = dL/dM · diag(s)
+
+四元数梯度 (q = [r, x, y, z]):
+    dL/dq = dL/dR · ∂R/∂q
+
+    ∂R/∂q 是 4 个 3×3 矩阵 (解析公式, 见下文)。
+
+    dL/dr = 2·[x·(dR12-dR21) + y·(dR20-dR02) + z·(dR01-dR10)]
+    dL/dx = 2·[r·(dR12-dR21) + y·(dR01+dR10) + z·(dR02+dR20) - 2x·(dR11+dR22)]
+    dL/dy = 2·[r·(dR20-dR02) + x·(dR01+dR10) + z·(dR12+dR21) - 2y·(dR00+dR22)]
+    dL/dz = 2·[r·(dR01-dR10) + x·(dR02+dR20) + y·(dR12+dR21) - 2z·(dR00+dR11)]
+
+    其中 dRij = dL/dR 的对应元素。
+
+同 preprocess_backward：一对一映射，无原子冲突。
+可以考虑与 preprocess_backward 融合为单个 kernel。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+6. Kernel D: sh_backward — SH 系数梯度 + 视线方向对均值的依赖
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+前向: color = Σ_k Y_k(d) · sh_k + 0.5,  d = normalize(mean3d - campos)
+
+VJP (对 SH 系数):
+    dL/d_sh_k = Y_k(d) · dL/d_color    (简单的线性反传)
+
+VJP (视线方向 → mean3d):
+    dL/dd = Σ_k (∂Y_k/∂d) · sh_k · dL/d_color
+
+    ∂Y_k/∂d 是各 SH 基函数对 (x,y,z) 的偏导 (解析公式)
+    例如 degree 1: ∂Y_1^{-1}/∂y = -SH_C1, 其余为零
+
+    dL/d_mean3d += (∂d/∂mean3d)^T · dL/dd
+
+    ∂d/∂mean3d = (1/||v||) · (I - d·d^T)    (归一化的 Jacobian)
+    其中 v = mean3d - campos
+
+一对一映射，无原子冲突。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+7. 核心挑战：Metal 上的原子梯度累加
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+7.1 问题定义
+─────────────
+
+rasterize_backward 是唯一需要原子操作的 kernel。
+
+一个高斯球可能覆盖多个 Tile，每个 Tile 有 256 个像素线程。
+一个大高斯球（radius=50px）可能被 ~40 个 Tile × 256 个线程 = ~10000 个线程
+同时写入 dL/d_rgb[gauss_id]。
+
+这会导致严重的原子竞争 (atomic contention)。
+
+7.2 Metal 原子操作的限制
+─────────────────────────
+
+Metal 支持:
+  ● atomic_fetch_add_explicit(device atomic_float*, float, memory_order_relaxed)
+  ● 不支持 memory_order_seq_cst (仅 relaxed/acquire/release)
+  ● 不支持 64-bit 原子 (无法打包 status+value 做 CAS)
+  ● 浮点原子加法在 M1 上可能走慢速路径 (非原生 FP32 atomic add)
+
+好消息: relaxed 序对于梯度累加已经足够 (求和是交换律)。
+坏消息: 高竞争时性能严重退化。
+
+7.3 策略分析
+─────────────
+
+策略 A: 朴素全局原子加 (Inria 原版)
+  ● 每个像素线程直接 atomic_add 到全局 dL/d_xxx[gauss_id]
+  ● 优点: 实现最简单
+  ● 缺点: 一个大高斯球面临 ~10K 次竞争 → 极慢
+  ● 适用: 快速原型验证 (先正确，再优化)
+
+策略 B: SIMD 组内规约 + 代表线程原子加 (gsplat 风格)
+  ● 步骤:
+      1. 每个 SIMD group (32 线程) 内做 simd_shuffle_xor 规约
+      2. 仅 lane 0 执行 atomic_add → 竞争降低 32×
+  ● Metal 实现:
+      float sum = val;
+      for (ushort offset = 16; offset > 0; offset >>= 1)
+          sum += simd_shuffle_xor(sum, offset);
+      if (simd_lane_id == 0)
+          atomic_fetch_add_explicit(&grad[gid], sum, memory_order_relaxed);
+  ● 竞争: 从 256/tile 降到 8/tile (= 256/32 SIMD groups)
+  ● 推荐作为第一优化目标
+
+策略 C: Threadgroup 内全局规约 + 单线程原子加
+  ● 步骤:
+      1. 每批高斯球处理完后，在 threadgroup shared memory 中规约
+      2. 仅 thread 0 执行 atomic_add → 竞争降低 256×
+  ● 挑战: 需要 per-gaussian shared memory slot，但一批有 256 个高斯球
+           → 256 × 梯度维度 = 大量共享内存
+  ● 可行变体: "histogram binning" — 对同一高斯球的多次贡献在共享内存中累加
+  ● 竞争: 从 256/tile 降到 1/tile
+  ● 代价: 复杂的共享内存管理 + 更多 barrier
+
+策略 D: Per-Tile 梯度缓冲区 (延迟写入)
+  ● 为每个 (tile, gaussian) 对分配临时梯度缓冲区
+  ● Tile 内无原子冲突 (每个 Tile 有独立缓冲区)
+  ● 最后用一个 reduce kernel 聚合所有 Tile 的贡献
+  ● 优点: 完全消除原子竞争
+  ● 缺点: 额外显存 = num_intersections × 梯度维度 ≈ 11M × 48 bytes = 500MB
+           对 16GB 统一内存压力巨大 → 不推荐
+
+7.4 推荐方案
+─────────────
+
+Phase 1 (正确性验证): 策略 A — 朴素全局原子加
+  ● 用 NumPy 参考实现逐像素对比验证梯度正确性
+  ● 性能预期: 慢，但能工作
+
+Phase 2 (性能优化): 策略 B — SIMD 组内规约
+  ● 32× 竞争降低，实现复杂度适中
+  ● 预期足以达到可训练的性能
+
+Phase 3 (极致优化，如果需要): 策略 C 的变体
+  ● 对占屏幕面积最大的 "热点" 高斯球做特殊处理
+  ● 大部分小高斯球 (覆盖 1-2 tiles) 策略 B 已经足够
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+8. 前向保存清单 (save_for_backward)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+rasterize_forward 必须额外输出并保存以下数据供 backward 使用：
+
+  ┌────────────────────────┬───────────┬─────────────────────────────┐
+  │ 数据                    │ 大小       │ 用途                        │
+  ├────────────────────────┼───────────┼─────────────────────────────┤
+  │ T_final[H, W]          │ H×W×4     │ 每像素最终透射率，反向恢复Ti │
+  │ n_contrib[H, W]        │ H×W×4     │ 每像素最后一个有效高斯的索引 │
+  │ point_list[]           │ 已有       │ tile-then-depth 排序的ID列表│
+  │ tile_bins[]            │ 已有       │ 每tile的[start, end)范围    │
+  │ means2d[N, 2]          │ 已有       │ 反向需要计算 Δ = pixel-mean │
+  │ cov2d[N, 3]            │ 已有       │ 反向需要 conic 逆矩阵      │
+  │ colors[N, 3]           │ 输入       │ 反向 alpha 梯度公式需要 c_i │
+  │ opacities[N]           │ 输入       │ 反向需要 o_i               │
+  └────────────────────────┴───────────┴─────────────────────────────┘
+
+  额外显存开销: H×W×8 bytes = 1280×720×8 ≈ 7 MB (可忽略)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+9. Metal Kernel 清单与接口设计
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+9.1 新增 Metal Kernels (csrc/kernels/ 目录)
+─────────────────────────────────────────────
+
+文件: rasterize_backward.metal
+  kernel void rasterize_backward(
+      // 前向保存
+      device const float*  means2d,       // [N*2]
+      device const float*  cov2d,         // [N*3] → 计算 conic
+      device const float*  colors,        // [N*3]
+      device const float*  opacities,     // [N]
+      device const uint*   tile_bins,     // [num_tiles*2]
+      device const uint*   point_list,    // [num_isect]
+      device const float*  T_final,       // [H*W] — 前向新增输出
+      device const uint*   n_contrib,     // [H*W] — 前向新增输出
+      // 上游梯度
+      device const float*  dL_dC_pixel,   // [H*W*3]
+      // 下游梯度 (全局原子累加)
+      device atomic_float* dL_d_rgb,      // [N*3]
+      device atomic_float* dL_d_opacity,  // [N]
+      device atomic_float* dL_d_cov2d,    // [N*3] (dL/d_conic)
+      device atomic_float* dL_d_mean2d,   // [N*2]
+      constant RasterizeParams& params
+  );
+
+文件: preprocess_backward.metal
+  kernel void preprocess_backward(
+      // 前向保存
+      device const float*  means3d,       // [N*3]
+      device const float*  scales,        // [N*3]
+      device const float*  quats,         // [N*4]
+      constant float*      viewmat,       // [16]
+      device const float*  cov2d,         // [N*3]
+      device const uint*   radii,         // [N]
+      // 上游梯度
+      device const float*  dL_d_cov2d,    // [N*3]
+      device const float*  dL_d_mean2d,   // [N*2]
+      // 下游梯度
+      device float*        dL_d_means3d,  // [N*3]
+      device float*        dL_d_scales,   // [N*3]
+      device float*        dL_d_quats,    // [N*4]
+      constant PreprocessParams& params
+  );
+
+文件: sh_backward.metal
+  kernel void sh_backward(
+      device const float*   directions,    // [N*3] (或 float4)
+      device const half*    sh_coeffs,     // [N*K*3]
+      device const float*   dL_d_colors,   // [N*3] (从 rasterize_bw)
+      device float*         dL_d_sh,       // [N*K*3]
+      device float*         dL_d_dir,      // [N*3] → 加入 dL_d_means3d
+      constant SHParams&    params
+  );
+
+9.2 C++ Wrapper 新增
+─────────────────────
+
+metal_wrapper.h 新增声明:
+  double metal_rasterize_backward(...);
+  double metal_preprocess_backward(...);
+  double metal_sh_backward(...);
+
+metal_wrapper.mm 新增:
+  rasterize_bw_pso, preprocess_bw_pso, sh_bw_pso (3 个新 PSO → 共 13 个)
+
+9.3 PyBind11 新增
+──────────────────
+
+bindings.cpp 新增:
+  ● rasterize_backward()     — 单独调用光栅化反传
+  ● preprocess_backward()    — 单独调用预处理反传
+  ● sh_backward()            — 单独调用 SH 反传
+  ● render_backward()        — 全链路反传 (chain all)
+
+9.4 前向修改
+─────────────
+
+rasterize_forward 需要新增两个输出:
+  ● T_final[H, W]   — float, 最终透射率
+  ● n_contrib[H, W] — uint32, 最后有效高斯索引
+
+这需要修改:
+  1. rasterize.metal — 在写入 out_img 时同时写入 T_final 和 n_contrib
+  2. metal_wrapper.mm — 增加两个输出 buffer
+  3. bindings.cpp — 返回额外输出
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+10. PyTorch autograd.Function 集成方案
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class MetalGaussianRasterizer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, means3d, scales, quats, colors, opacities,
+                viewmat, camera_params):
+        # 1. numpy 转换 (torch→numpy, 共享内存)
+        # 2. 调用 render_forward()
+        # 3. ctx.save_for_backward(means3d, scales, quats, ...)
+        # 4. 保存 T_final, n_contrib, point_list, tile_bins 等中间结果
+        # 5. 返回 image tensor
+
+    @staticmethod
+    def backward(ctx, grad_image):
+        # 1. 取出 saved tensors
+        # 2. 调用 render_backward()
+        # 3. 返回各参数的梯度
+
+接入 minGS 训练循环:
+    rasterizer = MetalGaussianRasterizer.apply
+    image = rasterizer(means3d, scales, quats, sh_colors, opacities,
+                       viewmat, cam_params)
+    loss = l1_loss(image, gt_image) + ssim_loss(image, gt_image)
+    loss.backward()  # 自动触发 backward
+    optimizer.step()
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+11. 实现优先级与里程碑
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+M1: 修改前向 rasterize 保存 T_final + n_contrib
+    ● 修改 rasterize.metal, wrapper, bindings
+    ● 验证: 确认新输出不影响原有正确性
+
+M2: rasterize_backward kernel (策略 A — 朴素原子)
+    ● 最复杂的 kernel: 逆序遍历 + 共享内存 + 原子加
+    ● 验证: 对 10 个高斯球，逐像素与 NumPy 梯度对比
+
+M3: preprocess_backward + cov3d_backward kernel
+    ● 可融合为单个 kernel (1:1 映射，无原子)
+    ● 验证: 与 NumPy 链式求导对比
+
+M4: sh_backward kernel
+    ● 最简单: 线性反传 + 视线方向 Jacobian
+    ● 验证: 与 NumPy 对比
+
+M5: PyTorch autograd.Function + minGS 接入
+    ● 封装 forward + backward 为 torch Function
+    ● 在 minGS 的 cat 场景上跑 100 iteration 验证收敛
+
+M6: 性能优化
+    ● rasterize_backward 升级为策略 B (SIMD 规约)
+    ● 性能目标: backward ≤ 2× forward 耗时
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+12. 数值稳定性注意事项清单
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[!] T_i 恢复: T_i = T_{i+1} / (1 - α_i)
+    当 α_i → 1 时分母 → 0 → 爆炸
+    防护: clamp α_i ≤ 0.999 (前向已做)，clamp (1-α) ≥ 0.001
+
+[!] dL/dα 公式中的 1/(1-α) 项
+    同上问题。确保 (1-α) 不为零。
+
+[!] cov2d 逆矩阵梯度
+    行列式 det = ac - b² 在退化高斯球上为零
+    前向已用 ε=1e-6 守卫，反向同样需要
+
+[!] SH 反传中的归一化 Jacobian
+    ∂normalize(v)/∂v = (I - d·d^T) / ||v||
+    当 ||v|| → 0 (高斯球在相机位置) → 爆炸
+    防护: clamp ||v|| ≥ 1e-8
+
+[!] 四元数梯度
+    旋转矩阵对四元数的导数假设 ||q|| = 1
+    训练中四元数可能偏离单位长度
+    防护: 每次迭代后重新归一化 (或在 kernel 内部归一化)
+
+[!] FOV 钳位区域的梯度
+    如果 camera-space 坐标被 clamp 到 ±1.3·tan_fov，
+    则该方向的梯度应为零 (否则优化器会推动高斯球到画面外)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EOF — Metal-GS Backward Design Document v1.0
