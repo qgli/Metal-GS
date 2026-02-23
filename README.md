@@ -172,9 +172,13 @@ Metal-GS/
 
 ## Acknowledgements
 
-- [gsplat](https://github.com/nerfstudio-project/gsplat) — reference CUDA kernels for the rasterization pipeline
-- [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) — Kerbl et al. 2023
-- [minGS](https://github.com/fjanoos/minGS) — minimal 3DGS training framework
+Metal-GS builds on the work of several excellent open-source projects:
+
+- **[gsplat](https://github.com/nerfstudio-project/gsplat)** — reference CUDA kernels for the rasterization pipeline. Metal-GS reimplements the gsplat forward/backward kernels as Metal compute shaders with architecture-specific adaptations (cooperative fetch, SIMD prefix sums, hard capping for TBDR).
+- **[3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)** — Kerbl et al. 2023, the foundational algorithm.
+- **[minGS](https://github.com/shiukaheng/minGS)** (Shiu Ka Heng) — minimal 3DGS training framework. Metal-GS uses a modified fork: replaced CUDA KNN with a Metal Morton-code KNN kernel, removed the CUDA/`diff-gaussian-rasterization` dependency, and wired up MPS tensor support.
+- **[mlx-splat](https://github.com/daikiad/mlx-splat)** (daikiad) — MLX-native Gaussian Splatting. Studied for Apple Silicon tiling strategy and alpha-blending formulation; Metal-GS takes a different approach (PyTorch MPS + raw Metal compute shaders rather than MLX primitives).
+- **[OpenSplat](https://github.com/pierotofy/OpenSplat)** (Piero Toffanin) — portable C++ 3DGS with Metal backend via gsplat-metal. Studied for Metal shader dispatch patterns; Metal-GS differs in using a single-encoder architecture with `memoryBarrierWithScope` rather than multi-encoder passes.
 
 ---
 

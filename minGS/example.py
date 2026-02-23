@@ -62,7 +62,7 @@ device = "mps"
 print(f"Using device: {device}  (Metal GPU rasterizer active regardless)")
 
 # ---- Train with Metal rasterizer (viewer disabled to avoid GPU contention) ----
-ITERATIONS = 2000
+ITERATIONS = 500
 train(model, cameras, iterations=ITERATIONS, densify_until_iter=30,
       device=device, use_viewer=False)
 

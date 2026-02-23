@@ -126,6 +126,9 @@ kernel void knn_search(
 
     // Track K nearest squared distances (simple insertion sort)
     // Initialize with large values
+    // NOTE: K is always 3 for 3DGS scale initialization.
+    // Metal does not support VLAs, so we fix the array to 3 and clamp K.
+    K = min(K, 3u);
     float best[3] = { 1e30f, 1e30f, 1e30f };
 
     // Search window: [tid - W, tid + W] in sorted order

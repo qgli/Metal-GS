@@ -14,6 +14,12 @@ Success criteria: Max error < 1e-4 (FP32 precision threshold)
 
 import numpy as np
 import sys
+import pathlib
+
+# Add _archive/ to sys.path so reference_preprocess can be found
+_archive_dir = str(pathlib.Path(__file__).resolve().parent.parent)
+if _archive_dir not in sys.path:
+    sys.path.insert(0, _archive_dir)
 
 try:
     from metal_gs._metal_gs_core import preprocess_forward
