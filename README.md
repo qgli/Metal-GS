@@ -79,7 +79,7 @@ csrc/kernels/*.metal ── 15 PSOs, AOT-compiled metallib
 # Create environment
 conda create -n metal-gs python=3.10 -y
 conda activate metal-gs
-pip install torch numpy pybind11 tqdm Pillow
+pip install torch numpy pybind11 tqdm Pillow viser
 
 # Build (AOT-compiles Metal shaders + C++/ObjC++ extension)
 cd Metal-GS
@@ -95,7 +95,7 @@ cd minGS
 python example.py
 ```
 
-This trains 500 iterations on the bundled COLMAP dataset (165K Gaussians, 179 cameras, 516×344 @ 2x downsample) and saves `cat_mac_render.png`.
+This trains 500 iterations on the bundled COLMAP dataset (165K Gaussians, 179 cameras, 516×344 @ 2x downsample) with a live Viser viewer at [http://localhost:8080](http://localhost:8080), then saves `cat_mac_render.png`.
 
 ### Use as a Library
 
@@ -145,6 +145,58 @@ loss.backward()
 | Dataset | Points | Resolution | Cap | Speed | Final Loss |
 |---|---|---|---|---|---|
 | Cat (COLMAP) | 165K | 516×344 (2x) | 1024 | ~2.6 it/s | 0.094 |
+| Cat (COLMAP) | 165K | 1032×688 (1x) | 1024 | ~0.6 it/s | — |
+
+---
+
+## Hardware Tested
+
+> **Metal-GS v1.0 has been developed and stress-tested exclusively on the weakest Apple Silicon chip: M1 with 7 GPU cores and 16GB unified memory (~4–6GB usable after system overhead).**
+
+This is a deliberate design choice. If the code survives the M1's constraints — 7 GPU cores, no hardware ray tracing, no BF16, and macOS's aggressive 2-second GPU watchdog — it will run on anything Apple ships.
+
+| Chip | GPU Cores | Memory | Status |
+|---|---|---|---|
+| **M1 (7-core)** | 7 | 16GB | ✅ **Fully tested** — 2000 iterations at full resolution |
+| M1 Pro/Max/Ultra | 16–64 | 32–192GB | 🔜 Expected to work (same ISA, more headroom) |
+| M2/M3/M4 family | 8–40 | 8–192GB | 🔜 Performance testing planned on M4 Max |
+
+**For M3/M4 users:** You can safely increase `max_gaussians_per_tile` beyond 1024 (try 2048–4096) and set `DOWNSAMPLE=1` for full-resolution training. M4+ users can also enable `ENABLE_BF16=1` in `setup.py` for mixed-precision training.
+
+---
+
+## Known Limitations
+
+- **Viser real-time visualization:** Verified working on M1 7-core GPU. Training + live Viser rendering runs concurrently without GPU watchdog warnings (~2.7 it/s with viewer active, ~5.5 it/s without). Frame drops may occur under extreme load.
+- **No multi-GPU:** Metal-GS targets single-GPU Apple Silicon. Multi-GPU (Mac Pro with multiple M2 Ultra) is not supported.
+- **FP32 only on M1:** BF16 requires Apple GPU Family 9+ (M4). M1/M2/M3 run all kernels in FP32.
+- **Densification scale:** The bundled minGS trainer uses a simplified densification schedule (30 iterations). For production quality, increase `densify_until_iter`.
+
+---
+
+## Dataset
+
+Metal-GS ships with a COLMAP-processed cat dataset (179 frames, 165K points) for quick testing.
+
+**Download:** The dataset will be available on [Google Drive](https://drive.google.com/) (link coming soon).
+
+### Expected COLMAP Directory Structure
+
+```
+data/cat/
+├── images/                   # 179 source images (frame_00001.JPG … frame_00179.JPG)
+│   ├── frame_00001.JPG
+│   ├── frame_00002.JPG
+│   └── ...
+└── sparse/
+    └── 0/
+        ├── cameras.bin       # Camera intrinsics (COLMAP format)
+        ├── images.bin        # Camera extrinsics (COLMAP format)
+        ├── points3D.bin      # 3D point cloud (COLMAP format)
+        └── points3D.ply      # Point cloud in PLY format (optional)
+```
+
+To use your own data, run COLMAP on your images and place the output in the same structure. Metal-GS reads the standard COLMAP binary format via `minGS/gs/io/colmap/`.
 
 ---
 

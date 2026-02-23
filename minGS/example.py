@@ -35,7 +35,7 @@ print(f"Loaded {len(cameras)} cameras, {len(pointcloud.points)} points")
 # 2x: ~516×344, ~726 tiles — cooperative early-out in the rasterize kernel
 # ensures threadgroups exit as soon as all pixels are saturated, avoiding
 # the macOS GPU watchdog "Impacting Interactivity" timeout.
-DOWNSAMPLE = 1
+DOWNSAMPLE = 2
 for cam in cameras:
     if cam.image is not None:
         C, H, W = cam.image.shape
@@ -61,10 +61,10 @@ print(f"Created GaussianModel with {len(model)} Gaussians")
 device = "mps"
 print(f"Using device: {device}  (Metal GPU rasterizer active regardless)")
 
-# ---- Train with Metal rasterizer (viewer disabled to avoid GPU contention) ----
+# ---- Train with Metal rasterizer + Viser real-time viewer ----
 ITERATIONS = 500
 train(model, cameras, iterations=ITERATIONS, densify_until_iter=30,
-      device=device, use_viewer=False)
+      device=device, use_viewer=True)
 
 # ---- Render final image from first camera and save ----
 print("\nRendering final image...")
