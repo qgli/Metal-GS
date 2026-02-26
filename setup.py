@@ -57,7 +57,9 @@ class MetalBuildExt(build_ext):
             _postargs = list(extra_postargs)
             if src.endswith('.mm'):
                 _postargs = [a for a in _postargs if a not in ('-std=c++17',)]
-                _postargs += ['-ObjC++', '-std=c++17', '-fobjc-arc']
+                _postargs += ['-ObjC++', '-std=c++17']
+                # Do NOT add -fobjc-arc: PyTorch MPS headers use manual retain/release
+                _postargs = [a for a in _postargs if a != '-fobjc-arc']
             return original_compile(obj, src, ext, cc_args, _postargs, pp_opts)
 
         self.compiler._compile = patched_compile
@@ -123,6 +125,12 @@ class MetalBuildExt(build_ext):
         print("="*72 + "\n")
 
 
+def get_torch_paths():
+    """Get torch include and library paths."""
+    from torch.utils.cpp_extension import include_paths, library_paths
+    return include_paths(), library_paths()
+
+
 def get_pybind11_include():
     """Get pybind11 include path."""
     import pybind11
@@ -131,6 +139,8 @@ def get_pybind11_include():
 
 def build_extension():
     """Build the main C++ extension."""
+    torch_inc, torch_lib = get_torch_paths()
+
     # Extra compile args for ObjC++ / C++17
     extra_compile_args = [
         "-std=c++17",
@@ -138,8 +148,9 @@ def build_extension():
         "-Wall",
         "-Wno-unused-variable",
         "-Wno-unused-function",
-        # ObjC ARC
-        "-fobjc-arc",
+        # Torch headers
+        "-DTORCH_API_INCLUDE_EXTENSION_H",
+        "-DTORCH_EXTENSION_NAME=_metal_gs_core",
     ]
 
     extra_link_args = [
@@ -147,17 +158,20 @@ def build_extension():
         "-framework", "Foundation",
         "-framework", "MetalPerformanceShaders",
     ]
+    for lp in torch_lib:
+        extra_link_args += ["-L" + lp, "-Wl,-rpath," + lp]
+    extra_link_args += ["-ltorch", "-ltorch_cpu", "-lc10", "-ltorch_python"]
 
     ext = Extension(
         name="metal_gs._metal_gs_core",
         sources=[
-            "csrc/bindings.cpp",
-            "csrc/metal_wrapper.mm",
+            "csrc/mps_bindings.cpp",
+            "csrc/mps_ops.mm",
         ],
         include_dirs=[
             "csrc",
             get_pybind11_include(),
-        ],
+        ] + torch_inc,
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
         language="c++",
@@ -167,14 +181,14 @@ def build_extension():
 
 setup(
     name="metal-gs",
-    version="0.2.0",
-    description="Apple Silicon-native Gaussian Splatting operators",
+    version="0.3.1",
+    description="Apple Silicon-native Gaussian Splatting operators (MPS zero-copy)",
     packages=find_packages(),
     ext_modules=[build_extension()],
     cmdclass={"build_ext": MetalBuildExt},
     python_requires=">=3.10",
     install_requires=[
-        "numpy",
+        "torch>=2.1",
         "pybind11>=2.11",
     ],
     # Include Metal shader sources in the package (compiled at runtime)

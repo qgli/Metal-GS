@@ -4,7 +4,23 @@
 
 Metal-GS is a fully differentiable 3D Gaussian Splatting renderer that runs entirely on Apple Silicon GPUs via Metal compute shaders. It implements the complete forward + backward pipeline (SH evaluation, projection, radix sort, tile binning, alpha-blending rasterization) with all kernels AOT-compiled into a single `.metallib`.
 
-> **v0.2** — trains 165K Gaussians at **~11 it/s on M4** (BF16, 516×344) | ~2.6 it/s on M1 16GB.
+> **v0.3** — trains 165K Gaussians at **~25 it/s on M4** (FP32, 516×344) via pure MPS Custom Op architecture. 2.5× faster than v0.2.
+
+---
+
+## What's New in v0.3
+
+v0.3 is a complete rewrite of the GPU dispatch layer. The entire CPU↔GPU data pipeline has been replaced with **MPS Custom Ops** — Metal kernels injected directly into PyTorch's internal MPS command stream, achieving true zero-copy execution.
+
+| | v0.2 | v0.3 |
+|---|---|---|
+| Dispatch layer | `metal_wrapper.mm` (1553 LOC) | `mps_ops.mm` (855 LOC) |
+| Data flow | numpy → `newBufferWithBytes:` → kernel → memcpy → numpy | `getMTLBufferStorage()` — direct buffer bind, zero copies |
+| Sync barriers per iter | 9 (one per kernel) | **1** (read `num_intersections` only) |
+| CPU↔GPU copies per iter | 18+ | **0** |
+| Speed (M4, 165K, 516×344) | ~11 it/s | **~25 it/s** |
+
+See [docs/reports/V0.3_ARCHITECTURE_JOURNEY.md](docs/reports/V0.3_ARCHITECTURE_JOURNEY.md) for the full architectural exploration story (4 phases, 3 dead ends, 1 breakthrough).
 
 ---
 
@@ -16,7 +32,7 @@ This is not a bug — it is a design constraint. On M1/M2 (including Pro/Max/Ult
 
 ## The Solution: Depth-Sorted Dynamic Hard Capping
 
-Since Gaussians are processed in strict front-to-back depth order, we apply a per-tile hard cap (`max_gaussians_per_tile`, default 1024). Dense tiles are truncated, discarding only the most distant (and most occluded) Gaussians.
+Since Gaussians are processed in strict front-to-back depth order, we apply a per-tile hard cap (`max_gaussians_per_tile`, default 4096). Dense tiles are truncated, discarding only the most distant (and most occluded) Gaussians.
 
 ### Why Truncation Is Mathematically Safe
 
@@ -44,42 +60,46 @@ The cap is a runtime parameter (not a compile-time constant), tunable per scene 
 
 ---
 
-## Architecture
+## Architecture (v0.3)
 
 ```
-PyTorch autograd (CPU/MPS)
+PyTorch autograd (MPS device)
     │
     ▼
-metal_gs/rasterizer.py ── MetalGaussianRasterizer (autograd.Function)
+metal_gs/rasterizer.py ── MetalGaussianRasterizer (torch.autograd.Function)
+    │                      All tensors remain on MPS. No .cpu(), no numpy.
+    ▼
+_metal_gs_core (pybind11, torch::Tensor API)
     │
     ▼
-_metal_gs_core (PyBind11)
-    │
+csrc/mps_ops.mm ── MPS Custom Op dispatch layer
+    │  ┌──────────────────────────────────────────────────────────────────┐
+    │  │  Uses PyTorch's internal MPSStream (shared command queue)        │
+    │  │  getMTLBufferStorage() extracts id<MTLBuffer> from MPS tensors  │
+    │  │  PSOs created on PyTorch's MPS device                           │
+    │  │  Single encoder per phase — memoryBarrierWithScope between ops  │
+    │  │  ONE unavoidable sync: read num_intersections for allocation    │
+    │  └──────────────────────────────────────────────────────────────────┘
     ▼
-csrc/metal_wrapper.mm ── ObjC++ dispatch layer
-    │  ┌──────────────────────────────────────────────────────────────┐
-    ├──│  Single MTLCommandQueue, one command buffer per dispatch     │
-    │  │  MTLResourceStorageModeShared — zero-copy unified memory     │
-    │  │  @autoreleasepool on all 9 entry points                      │
-    │  └──────────────────────────────────────────────────────────────┘
-    ▼
-csrc/kernels/*.metal ── 15 PSOs, AOT-compiled metallib
-    ├── sh_forward.metal        SH basis evaluation
-    ├── preprocess.metal        3D→2D projection, cov2d, tile bounds
-    ├── radix_sort.metal        32-bit radix sort (histogram, scan, scatter)
-    ├── tile_binning.metal      Gaussian→tile assignment + tile_range
-    ├── rasterize.metal         Forward alpha blending (cooperative fetch)
+csrc/kernels/*.metal ── 17 PSOs, AOT-compiled metallib
+    ├── sh_forward.metal          SH basis evaluation (half precision I/O)
+    ├── preprocess.metal          3D→2D projection, cov2d, tile bounds
+    ├── radix_sort.metal          32-bit radix sort (histogram, scan, scatter)
+    ├── tile_binning.metal        Gaussian→tile assignment + tile_range
+    ├── rasterize.metal           Forward alpha blending (cooperative fetch)
     ├── rasterize_backward.metal  Backward (reverse traversal, atomic grads)
     ├── preprocess_backward.metal Projection backward
-    ├── sh_backward.metal       SH backward
-    └── knn.metal               Morton-code KNN for scale initialization
+    ├── sh_backward.metal         SH backward (half precision I/O)
+    └── knn.metal                 Morton-code KNN for scale initialization
 ```
 
 **Key design decisions:**
-- **Single encoder per dispatch** — no multi-pass command buffer splitting; `memoryBarrierWithScope` between stages
+- **MPS stream integration** — all kernels dispatch through `at::mps::getCurrentMPSStream()`, sharing PyTorch's `MTLCommandQueue`. No competing command queues.
+- **Zero-copy buffer binding** — `getMTLBufferStorage()` extracts the `id<MTLBuffer>` that backs each MPS tensor, directly binding it to kernel arguments. No `newBufferWithBytes:`, no memcpy.
+- **Single encoder per phase** — multiple kernels share one `MTLComputeCommandEncoder`, separated by `memoryBarrierWithScope`. One `synchronize(COMMIT_AND_WAIT)` per forward pass.
 - **3-level prefix sum** for radix sort — block-level scan → block-sum scan → scatter; all in one metallib
-- **FP32 everywhere** on M1 (`ENABLE_BF16=0`); set to `1` for M4+ with BF16 support
-- **Naive atomic gradient accumulation** (Strategy A) — correctness-first; SIMD reduction is a future optimization
+- **SH precision gate** — SH kernels read/write `half*` (FP16). The dispatch layer explicitly converts `sh_coeffs` to float16 before forward and backward dispatch.
+- **Naive atomic gradient accumulation** — correctness-first; SIMD reduction is a future optimization
 
 ---
 
@@ -89,6 +109,7 @@ csrc/kernels/*.metal ── 15 PSOs, AOT-compiled metallib
 
 - **macOS 14+ Sonoma** (macOS 13+ minimum, but 14+ recommended for Metal 3.1+ features)
 - **Apple Silicon** (M1/M2/M3/M4 — any variant)
+- **PyTorch 2.1+** (required for MPS stream internals)
 - **Xcode Command Line Tools:**
   ```bash
   xcode-select --install
@@ -98,13 +119,14 @@ csrc/kernels/*.metal ── 15 PSOs, AOT-compiled metallib
   xcodebuild -downloadComponent MetalToolchain
   ```
   Without this step, compilation will fail with: `error: cannot execute tool 'metal' due to missing Metal Toolchain`.
-- **Python 3.10+** via conda (recommended) or system Python
 - **Verify** your toolchain:
   ```bash
   xcrun -sdk macosx metal --version   # Should print Apple metal version 3xxxx+
   ```
 
-### Install (FP32 — all Apple Silicon)
+### Install for M4 (BF16 enabled, default)
+
+The default configuration has `ENABLE_BF16=1` in `setup.py`, targeting M4+ (Apple GPU Family 9+) with native `bfloat16` hardware. This compiles Metal shaders with MSL 3.2.
 
 ```bash
 # Create environment (conda recommended — do NOT use venv for Metal extensions)
@@ -117,26 +139,20 @@ cd Metal-GS
 CC=/usr/bin/clang CXX=/usr/bin/clang++ pip install -e . --no-build-isolation
 ```
 
-### Install with BF16 (M4+ only — Apple GPU Family 9+)
+### Install for M1/M2/M3 (FP32 only)
 
-M4 and later chips include native `bfloat16` hardware instructions. Enabling BF16 provides ~5% training speedup with **zero gradient accuracy loss** (all gradients remain at $10^{-7}$ error vs float64 reference — identical to FP32).
+M1/M2/M3 chips do not have BF16 hardware. You must change `ENABLE_BF16` to `"0"` before building:
 
 ```bash
-# 1. Edit setup.py: change ENABLE_BF16 from "0" to "1"
-#    This switches Metal Shading Language from metal3.0 → metal3.2
-#    (bfloat type requires MSL 3.2+)
+# 1. Edit setup.py: change ENABLE_BF16 from "1" to "0"
+#    This switches Metal Shading Language from metal3.2 → metal3.0
 
-# 2. Clean build
+# 2. Build
 cd Metal-GS
-rm -rf build/ dist/ metal_gs.egg-info/
-CC=/usr/bin/clang CXX=/usr/bin/clang++ pip install -e . --no-build-isolation --force-reinstall
+CC=/usr/bin/clang CXX=/usr/bin/clang++ pip install -e . --no-build-isolation
 ```
 
-Why BF16 is free on M4:
-- The `ENABLE_BF16` flag only gates `AccumType` in the preprocess kernel's intermediate covariance accumulations
-- The rasterization kernel (the precision-critical alpha-blending path) remains FP32 regardless
-- M4's BF16 ALUs have identical throughput to FP16 but with FP32-range exponent (8 bits vs 5 bits)
-- Measured gradient error: FP32 `MaxAbs=3.73e-07` vs BF16 `MaxAbs=4.37e-07` — both within $10^{-7}$ of float64 reference
+> **Why BF16 is free on M4:** The `ENABLE_BF16` flag only gates `AccumType` in the preprocess kernel's intermediate covariance accumulations. The rasterization kernel (the precision-critical alpha-blending path) remains FP32 regardless. M4's BF16 ALUs have identical throughput to FP16 but with FP32-range exponent (8 bits vs 5 bits). Measured gradient error: FP32 `MaxAbs=3.73e-07` vs BF16 `MaxAbs=4.37e-07` — both within $10^{-7}$ of float64 reference.
 
 ### Train on COLMAP Data
 
@@ -147,17 +163,21 @@ cd minGS
 python example.py
 ```
 
-This trains 500 iterations on the bundled COLMAP dataset (165K Gaussians, 179 cameras, 516×344 @ 2x downsample) with a live Viser viewer at [http://localhost:8080](http://localhost:8080), then saves `cat_mac_render.png`.
+This trains 500 iterations on the bundled COLMAP dataset (165K Gaussians, 179 cameras, 516×344 @ 2x downsample) and saves `cat_mac_render.png`.
+
+> **⚠️ Viser viewer:** The example enables `use_viewer=True` by default. On v0.3, the Viser real-time viewer may crash training due to GPU command queue contention. If you experience crashes, edit `example.py` and set `use_viewer=False`. See [Known Limitations](#known-limitations).
 
 ### Use as a Library
 
 ```python
-import numpy as np
 import torch
 from metal_gs.rasterizer import MetalGaussianRasterizer, RenderSettings
 
+# All tensors must be on MPS device
+device = torch.device("mps")
+
 settings = RenderSettings(
-    viewmat=viewmat_np,            # [4,4] float32
+    viewmat=viewmat_tensor,        # [4,4] torch.Tensor on MPS
     tan_fovx=tan_fovx,
     tan_fovy=tan_fovy,
     focal_x=focal_x,
@@ -168,10 +188,10 @@ settings = RenderSettings(
     img_height=H,
     sh_degree=3,
     bg_color=(0.0, 0.0, 0.0),
-    max_gaussians_per_tile=1024,   # tune for your GPU
+    max_gaussians_per_tile=4096,   # tune for your GPU; 0 = unlimited (M3/M4)
 )
 
-# Fully differentiable — gradients flow through Metal compute shaders
+# Fully differentiable — gradients flow through MPS Custom Op Metal kernels
 image = MetalGaussianRasterizer.apply(
     means3d, scales, quats, sh_coeffs, opacities,
     viewmat_tensor, campos_tensor, settings
@@ -186,31 +206,35 @@ loss.backward()
 
 | Parameter | Default | Description |
 |---|---|---|
-| `max_gaussians_per_tile` | 1024 | Hard cap per tile. Prevents watchdog timeout on M1. Increase for higher quality on M3/M4 Pro. Set `0` for unlimited. |
+| `max_gaussians_per_tile` | 4096 | Hard cap per tile. Prevents watchdog timeout on M1/M2. Set `0` for unlimited on M3/M4. |
 | `DOWNSAMPLE` | 2 | Image downsampling factor in `example.py`. Use 1 for full-res on M3+ with ≥32GB. |
-| `ENABLE_BF16` | 0 | Set to 1 in `setup.py` for BF16 training on M4+ (Apple GPU Family 9+). Requires MSL 3.2 (auto-selected). |
+| `ENABLE_BF16` | 1 | Set to `0` in `setup.py` for M1/M2/M3 (no hardware BF16). Default `1` targets M4+. Requires MSL 3.2 (auto-selected). |
 
 ---
 
 ## Performance
 
-### M4 10-core GPU, 16GB (NEW)
+### v0.3 — M4 10-core GPU, 16GB
+
+| Dataset | Points | Resolution | Precision | Cap | Speed | Final Loss |
+|---|---|---|---|---|---|---|
+| Cat (COLMAP) | 165K | 516×344 (2x) | FP32 | 4096 | **~25.2 it/s** | 0.138 |
+
+### v0.2 (previous) — M4 10-core GPU, 16GB
 
 | Dataset | Points | Resolution | Precision | Cap | Speed | Final Loss |
 |---|---|---|---|---|---|---|
 | Cat (COLMAP) | 165K | 516×344 (2x) | FP32 | 1024 | ~10.2 it/s | 0.137 |
-| Cat (COLMAP) | 165K | 516×344 (2x) | **BF16** | 1024 | ~10.7 it/s | 0.130 |
-| Cat (COLMAP) | 165K | 516×344 (2x) | BF16 | 4096 | ~11.0 it/s | 0.134 |
+| Cat (COLMAP) | 165K | 516×344 (2x) | BF16 | 1024 | ~10.7 it/s | 0.130 |
 | Cat (COLMAP) | 165K | 516×344 (2x) | BF16 | 0 (∞) | ~11.3 it/s | 0.139 |
 
-### M1 7-core GPU, 16GB
+### v0.1 — M1 7-core GPU, 16GB
 
 | Dataset | Points | Resolution | Precision | Cap | Speed | Final Loss |
 |---|---|---|---|---|---|---|
 | Cat (COLMAP) | 165K | 516×344 (2x) | FP32 | 1024 | ~2.6 it/s | 0.094 |
-| Cat (COLMAP) | 165K | 1032×688 (1x) | FP32 | 1024 | ~0.6 it/s | — |
 
-> **M4 delivers 4x the throughput of M1** with identical mathematical precision. BF16 is free performance on M4 — zero gradient accuracy loss. See [M4_PERFORMANCE_REPORT.md](M4_PERFORMANCE_REPORT.md) for the full analysis.
+> **v0.3 is 2.5× faster than v0.2 and ~10× faster than v0.1**, with identical mathematical precision. The speedup comes entirely from eliminating CPU↔GPU synchronization — the GPU kernels themselves are unchanged.
 
 ---
 
@@ -218,28 +242,27 @@ loss.backward()
 
 | Chip | GPU Cores | Memory | GPU Family | Capping Required | BF16 | Status |
 |---|---|---|---|---|---|---|
-| **M1 (7-core)** | 7 | 16GB | Apple 7 | ✅ Yes (1024) | ❌ | ✅ **Fully tested** |
+| **M1 (7-core)** | 7 | 16GB | Apple 7 | ✅ Yes (1024) | ❌ | ✅ **Tested (v0.1)** |
 | M1 Pro/Max/Ultra | 16–64 | 32–192GB | Apple 7 | ✅ Yes (1024–4096) | ❌ | 🔜 Same ISA, needs cap |
 | M2 family | 8–38 | 8–192GB | Apple 8 | ✅ Yes (1024–4096) | ❌ | 🔜 Same ISA, needs cap |
 | M3 family | 10–40 | 8–128GB | **Apple 9** | ❌ Dynamic Caching | ❌ | 🔜 Cap=0 safe |
-| **M4 (10-core)** | 10 | 16GB | **Apple 9** | ❌ Dynamic Caching | ✅ | ✅ **Fully tested** |
+| **M4 (10-core)** | 10 | 16GB | **Apple 9** | ❌ Dynamic Caching | ✅ | ✅ **Tested (v0.3)** |
 | M4 Pro/Max/Ultra | 14–40 | 24–192GB | **Apple 9** | ❌ Dynamic Caching | ✅ | 🔜 Expected faster |
 
-> **Design philosophy:** Metal-GS v0.1 was developed exclusively on the weakest Apple Silicon (M1 7-core, 16GB) to ensure the code survives extreme constraints. v0.2 adds M4 BF16 native support and verifies the M3/M4 Dynamic Caching hypothesis.
+**M4 users:** Default config works out of the box (`ENABLE_BF16=1`). Set `max_gaussians_per_tile=0` (unlimited) for maximum quality.
 
-**M4 users:** Set `ENABLE_BF16=1` in `setup.py`, `max_gaussians_per_tile=0` (unlimited). See [M4_PERFORMANCE_REPORT.md](M4_PERFORMANCE_REPORT.md) for full benchmark data.
+**M1/M2 users:** Change `ENABLE_BF16=0` in `setup.py`, set `max_gaussians_per_tile=1024` (or up to 4096 on Pro/Max/Ultra with more GPU cores).
 
-**M1/M2 users:** Keep `ENABLE_BF16=0`, set `max_gaussians_per_tile=1024` (or up to 4096 on Pro/Max/Ultra with more GPU cores).
-
-**M3 users:** Keep `ENABLE_BF16=0` (no hardware BF16), but set `max_gaussians_per_tile=0` — Dynamic Caching eliminates the watchdog problem.
+**M3 users:** Change `ENABLE_BF16=0` (no hardware BF16), but set `max_gaussians_per_tile=0` — Dynamic Caching eliminates the watchdog problem.
 
 ---
 
 ## Known Limitations
 
-- **Viser real-time visualization:** Verified working on M1 7-core GPU. Training + live Viser rendering runs concurrently without GPU watchdog warnings (~2.7 it/s with viewer active, ~5.5 it/s without). Frame drops may occur under extreme load.
+- **⚠️ Viser real-time viewer crashes training (v0.3):** The v0.3 MPS Custom Op pipeline monopolizes PyTorch's GPU command queue. When Viser's rendering loop submits concurrent Metal work, the two compete for the same queue, causing GPU contention crashes. **Workaround:** Set `use_viewer=False` in `example.py`. Headless training is fully stable. This is a known limitation of sharing PyTorch's MPS stream with external Metal consumers.
 - **No multi-GPU:** Metal-GS targets single-GPU Apple Silicon. Multi-GPU (Mac Pro with multiple M2 Ultra) is not supported.
-- **FP32 only on M1:** BF16 requires Apple GPU Family 9+ (M4). M1/M2/M3 run all kernels in FP32.
+- **FP32 only on M1/M2/M3:** BF16 requires Apple GPU Family 9+ (M4). M1/M2/M3 run all kernels in FP32.
+- **M1/M2 backward compatibility:** v0.3 uses `ATen/mps/MPSStream.h` (PyTorch 2.1+ required). The MPS backend on M1 is expected to be functional but has not been re-tested with v0.3. The single sync point in the forward pass may have different performance characteristics on M1's 7-core GPU.
 - **Densification scale:** The bundled minGS trainer uses a simplified densification schedule (30 iterations). For production quality, increase `densify_until_iter`.
 
 ---
@@ -275,19 +298,24 @@ To use your own data, run COLMAP on your images and place the output in the same
 ```
 Metal-GS/
 ├── csrc/
-│   ├── kernels/          9 Metal shader files → AOT-compiled metallib
-│   ├── metal_wrapper.mm  ObjC++ dispatch layer (9 public functions)
-│   ├── metal_wrapper.h   C++ header
-│   └── bindings.cpp      PyBind11 bindings
+│   ├── kernels/              9 Metal shader files → AOT-compiled metallib (17 PSOs)
+│   ├── mps_ops.mm            MPS Custom Op dispatch layer (v0.3)
+│   ├── mps_bindings.cpp      pybind11 bindings (torch::Tensor API)
+│   ├── metal_wrapper.mm      Legacy v0.2 dispatch (kept for reference, not compiled)
+│   ├── metal_wrapper.h       Legacy v0.2 header
+│   └── bindings.cpp          Legacy v0.2 bindings (numpy API)
 ├── metal_gs/
-│   ├── rasterizer.py     PyTorch autograd wrapper + RenderSettings
+│   ├── rasterizer.py         PyTorch autograd wrapper + RenderSettings
 │   └── __init__.py
-├── minGS/                Minimal training harness (COLMAP loader, 3DGS model)
-│   ├── example.py        Entry point — train + render
-│   ├── gs/               GaussianModel, trainers, visualization
-│   └── data/cat/         Bundled COLMAP dataset
-├── setup.py              Build script (Metal AOT + C++/ObjC++ compilation)
-└── pyproject.toml        PEP 517 build-system declaration
+├── minGS/                    Minimal training harness (COLMAP loader, 3DGS model)
+│   ├── example.py            Entry point — train + render
+│   ├── gs/                   GaussianModel, trainers, visualization
+│   └── data/cat/             Bundled COLMAP dataset
+├── docs/
+│   └── reports/
+│       └── V0.3_ARCHITECTURE_JOURNEY.md   Architecture exploration report
+├── setup.py                  Build script (Metal AOT + C++/ObjC++ compilation)
+└── pyproject.toml            PEP 517 build-system declaration
 ```
 
 ---
@@ -302,12 +330,17 @@ Metal-GS/
 
 **Root cause:** SH evaluation is a **batched per-element dot product** ($\text{result}_c = \sum_k Y_k(\mathbf{d}) \cdot C_{k,c}$), where *both* operands are per-Gaussian. There is no shared matrix across the batch. To fit this into 8×8 MMA, we compute $D_{gg'} = \sum_k Y_k(\mathbf{d}_g) \cdot C_{g',k,c}$ — but only the diagonal ($g = g'$) is needed, wasting **87.5% of the MMA compute** on discarded cross-Gaussian products. The dedicated matrix hardware *is* approximately 8× faster per-operation, but this waste precisely cancels the advantage.
 
-**Takeaway for future SIMD work:**
-- `simdgroup_matrix` excels at **shared-operand** workloads (neural net inference, convolution) where one matrix (e.g., weights) is reused across a batch
-- For per-element independent operations, the scalar 1-thread-per-Gaussian kernel with full ALU utilization remains optimal
-- Better MMA candidates in this codebase: `rasterize.metal` (shared Gaussian data across tile pixels) and `preprocess.metal` (3×3 covariance matrix chains)
-
 **Code reference:** Full implementation, benchmark script, and mathematical analysis archived on branch [`exp/simd-sh-mma`](https://github.com/qgli/Metal-GS/tree/exp/simd-sh-mma).
+
+### ❌ UMA Zero-Copy via `.cpu().numpy()` (v0.2+)
+
+**Attempt:** Exploit Apple's Unified Memory Architecture to create `MTLBuffer`s backed by numpy array memory using `newBufferWithBytesNoCopy:`, eliminating the 19ms CPU↔GPU transfer measured in v0.2 profiling.
+
+**Result:** ~10 it/s — actually *slower* than v0.2. The transfer time was real but irrelevant; 55% of the iteration was spent on pipeline drain latency from 9 `waitUntilCompleted` synchronization barriers. Amdahl's Law: optimizing 21% of a pipeline where 55% is serialized yields zero net benefit.
+
+**The real insight:** UMA eliminates *hardware* copy cost, but software synchronization (`waitUntilCompleted`, `@autoreleasepool` cycling, Python↔C++ boundary crossings) dominates. This led directly to the v0.3 MPS Custom Op architecture.
+
+See [docs/reports/V0.3_ARCHITECTURE_JOURNEY.md](docs/reports/V0.3_ARCHITECTURE_JOURNEY.md) for the complete analysis.
 
 ---
 

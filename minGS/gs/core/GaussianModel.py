@@ -115,9 +115,9 @@ class GaussianModel(nn.Module):
         scales = self.scaling_activation(self.scales)                     # [N, 3]
         rotations = self.rotation_activation(self.rotations)              # [N, 4]
 
-        # Build render settings (numpy viewmat on CPU)
+        # Build render settings (viewmat as MPS tensor for v3 zero-copy)
         settings = RenderSettings(
-            viewmat=viewmat.detach().cpu().numpy().astype(np.float32),
+            viewmat=viewmat.detach().contiguous(),
             tan_fovx=tan_fov_x,
             tan_fovy=tan_fov_y,
             focal_x=focal_x,
@@ -211,8 +211,12 @@ class GaussianModel(nn.Module):
         else:
             # Use Metal-GS Morton-code KNN instead of CUDA distCUDA2
             points_np = np.asarray(pointcloud.points).astype(np.float32)
-            avg_sq_dist_np, _knn_ms = simple_knn_metal(points_np, k_neighbors=3, search_window=256)
-            dist2 = torch.clamp_min(torch.from_numpy(avg_sq_dist_np).float(), 0.0000001)
+            avg_sq_dist, _knn_ms = simple_knn_metal(points_np, k_neighbors=3, search_window=256)
+            if isinstance(avg_sq_dist, torch.Tensor):
+                avg_sq_dist = avg_sq_dist.cpu()
+            else:
+                avg_sq_dist = torch.from_numpy(avg_sq_dist)
+            dist2 = torch.clamp_min(avg_sq_dist.float(), 0.0000001)
             scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
 
         # Initialize rotation (on CPU — will be moved to device later)

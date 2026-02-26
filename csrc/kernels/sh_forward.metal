@@ -61,7 +61,7 @@ struct SHParams {
 //  One thread per Gaussian.  Threadgroup = 256 threads.
 // ---------------------------------------------------------------------------
 kernel void compute_sh_forward(
-    device const float3*  directions  [[buffer(0)]],
+    device const packed_float3* directions  [[buffer(0)]],
     device const half*    sh_coeffs   [[buffer(1)]],
     device half*          colors_out  [[buffer(2)]],
     constant SHParams&    params      [[buffer(3)]],
