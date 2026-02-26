@@ -129,6 +129,18 @@ def get_pybind11_include():
     return pybind11.get_include()
 
 
+def get_torch_include_dirs():
+    """Get PyTorch C++ include paths for torch::Tensor API."""
+    import torch.utils.cpp_extension
+    return torch.utils.cpp_extension.include_paths()
+
+
+def get_torch_library_dirs():
+    """Get PyTorch library paths for libtorch linking."""
+    import torch.utils.cpp_extension
+    return torch.utils.cpp_extension.library_paths()
+
+
 def build_extension():
     """Build the main C++ extension."""
     # Extra compile args for ObjC++ / C++17
@@ -165,12 +177,64 @@ def build_extension():
     return ext
 
 
+def build_uma_extension():
+    """Build the CPU-GPU Zero-Copy Synergy extension.
+    
+    This module uses torch::Tensor C++ API + ATen MPS internals to directly
+    access MPS tensor data via [MTLBuffer contents] — true UMA zero-copy.
+    Links against libtorch_cpu, libtorch_python, and libc10.
+    """
+    torch_inc = get_torch_include_dirs()
+    torch_lib = get_torch_library_dirs()
+
+    extra_compile_args = [
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wno-unused-variable",
+        "-Wno-unused-function",
+        "-fobjc-arc",
+        # PyTorch build flags
+        "-D_GLIBCXX_USE_CXX11_ABI=0",
+    ]
+
+    extra_link_args = [
+        "-framework", "Metal",
+        "-framework", "Foundation",
+        "-framework", "MetalPerformanceShaders",
+        # Link PyTorch libraries
+        "-ltorch",
+        "-ltorch_cpu",
+        "-ltorch_python",
+        "-lc10",
+    ]
+    # Add rpath for torch libs
+    for ld in torch_lib:
+        extra_link_args.extend(["-L" + ld, "-Wl,-rpath," + ld])
+
+    ext = Extension(
+        name="metal_gs._metal_gs_uma",
+        sources=[
+            "csrc/cpu_gpu_synergy.mm",
+        ],
+        include_dirs=[
+            "csrc",
+            get_pybind11_include(),
+        ] + torch_inc,
+        library_dirs=torch_lib,
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
+        language="c++",
+    )
+    return ext
+
+
 setup(
     name="metal-gs",
     version="0.2.0",
     description="Apple Silicon-native Gaussian Splatting operators",
     packages=find_packages(),
-    ext_modules=[build_extension()],
+    ext_modules=[build_extension(), build_uma_extension()],
     cmdclass={"build_ext": MetalBuildExt},
     python_requires=">=3.10",
     install_requires=[
