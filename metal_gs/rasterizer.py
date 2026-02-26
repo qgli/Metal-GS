@@ -17,7 +17,9 @@ Usage:
 import torch
 import numpy as np
 import gc
+import time
 from dataclasses import dataclass
+from metal_gs.profiler import kernel_profiler
 
 def _get_core():
     """Lazy-load the compiled Metal extension."""
@@ -79,6 +81,11 @@ class MetalGaussianRasterizer(torch.autograd.Function):
         if input_device.type == 'mps':
             torch.mps.synchronize()
 
+        profiling = kernel_profiler.enabled
+        if profiling:
+            kernel_profiler.begin_forward()
+            _t0 = time.perf_counter()
+
         # ---- Convert to numpy (contiguous float32, except SH which is float16) ----
         means3d_np  = means3d.detach().cpu().contiguous().numpy().astype(np.float32)
         scales_np   = scales.detach().cpu().contiguous().numpy().astype(np.float32)
@@ -91,6 +98,10 @@ class MetalGaussianRasterizer(torch.autograd.Function):
         sh_coeffs_np = sh_coeffs.detach().cpu().contiguous().numpy()
         if sh_coeffs_np.dtype != np.float16:
             sh_coeffs_np = sh_coeffs_np.astype(np.float16)
+
+        if profiling:
+            _t1 = time.perf_counter()
+            kernel_profiler.record("numpy_convert", (_t1 - _t0) * 1000.0)
 
         N = means3d_np.shape[0]
         K = sh_coeffs_np.shape[1]
@@ -112,6 +123,10 @@ class MetalGaussianRasterizer(torch.autograd.Function):
         colors_fp16 = colors_fp16.view(np.float16)  # [N, 3] fp16
         colors_fp32 = colors_fp16.astype(np.float32)  # [N, 3]
 
+        if profiling:
+            _t2 = time.perf_counter()
+            kernel_profiler.record("sh_forward", (_t2 - _t1) * 1000.0)
+
         # ---- Full forward render (preprocess → sort → bin → rasterize) ----
         fwd_result = core.render_forward(
             means3d_np, scales_np, quats_np, viewmat_np,
@@ -123,6 +138,16 @@ class MetalGaussianRasterizer(torch.autograd.Function):
             settings.bg_color[0], settings.bg_color[1], settings.bg_color[2],
             settings.max_gaussians_per_tile,
         )
+
+        # Capture per-kernel GPU timing from C++ layer
+        if profiling:
+            kernel_profiler.record("preprocess", fwd_result.get("preprocess_ms", 0.0))
+            kernel_profiler.record("depth_sort", fwd_result.get("sort_ms", 0.0))
+            kernel_profiler.record("tile_binning", fwd_result.get("binning_ms", 0.0))
+            kernel_profiler.record("rasterize", fwd_result.get("rasterize_ms", 0.0))
+            kernel_profiler.record_forward_stats(
+                N, fwd_result.get("num_visible", 0), 
+                fwd_result.get("num_intersections", 0))
 
         image_np = fwd_result["image"]  # [H, W, 3]
 
@@ -166,6 +191,11 @@ class MetalGaussianRasterizer(torch.autograd.Function):
             if input_device.type == 'mps':
                 torch.mps.synchronize()
 
+        if profiling:
+            _t3 = time.perf_counter()
+            kernel_profiler.record("torch_convert", (_t3 - _t2) * 1000.0)
+            kernel_profiler.end_pass()
+
         return image_tensor
 
     @staticmethod
@@ -176,12 +206,23 @@ class MetalGaussianRasterizer(torch.autograd.Function):
 
         device = grad_image.device
 
+        profiling = kernel_profiler.enabled
+        if profiling:
+            kernel_profiler.begin_backward()
+
         # Ensure MPS operations are complete before Metal dispatch
         if device.type == 'mps':
             torch.mps.synchronize()
 
+        if profiling:
+            _tb0 = time.perf_counter()
+
         # ---- Convert upstream gradient to numpy ----
         grad_img_np = grad_image.detach().cpu().contiguous().numpy().astype(np.float32)
+
+        if profiling:
+            _tb1 = time.perf_counter()
+            kernel_profiler.record("numpy_convert_bw", (_tb1 - _tb0) * 1000.0)
 
         # ---- Full backward pass ----
         bwd_result = core.render_backward(
@@ -210,6 +251,13 @@ class MetalGaussianRasterizer(torch.autograd.Function):
             fwd["n_contrib"],
             grad_img_np,
         )
+
+        # Capture per-kernel GPU timing from C++ layer
+        if profiling:
+            kernel_profiler.record("rasterize_bw", bwd_result.get("rasterize_bw_ms", 0.0))
+            kernel_profiler.record("preprocess_bw", bwd_result.get("preprocess_bw_ms", 0.0))
+            kernel_profiler.record("sh_bw", bwd_result.get("sh_bw_ms", 0.0))
+            _tb2 = time.perf_counter()
 
         device = grad_image.device
 
@@ -247,6 +295,11 @@ class MetalGaussianRasterizer(torch.autograd.Function):
         # Ensure all MPS transfers complete before returning gradients
         if device.type == 'mps':
             torch.mps.synchronize()
+
+        if profiling:
+            _tb3 = time.perf_counter()
+            kernel_profiler.record("torch_convert_bw", (_tb3 - _tb2) * 1000.0)
+            kernel_profiler.end_pass()
 
         # Free saved forward data immediately to release numpy arrays
         del ctx.metal_fwd
