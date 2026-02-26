@@ -4,7 +4,18 @@
 
 Metal-GS is a fully differentiable 3D Gaussian Splatting renderer that runs entirely on Apple Silicon GPUs via Metal compute shaders. It implements the complete forward + backward pipeline (SH evaluation, projection, radix sort, tile binning, alpha-blending rasterization) with all kernels AOT-compiled into a single `.metallib`.
 
-> **v0.3** — trains 165K Gaussians at **~25 it/s on M4** (FP32, 516×344) via pure MPS Custom Op architecture. 2.5× faster than v0.2.
+> **v0.3.1** — trains 165K Gaussians at **~25 it/s on M4** (FP32, 516×344) via pure MPS Custom Op architecture. 2.5× faster than v0.2.
+
+### Versions & Rollback
+
+| Tag | Speed | Stability | Best For |
+|-----|-------|-----------|----------|
+| **`v0.3.1`** (latest) | ~25 it/s | Aggressive | M4 max performance |
+| **`v0.2.0`** | ~11 it/s | Rock-stable | Production, Viser UI |
+| **`v0.1.0`** | ~6 it/s | Legacy | M1/M2 compatibility |
+
+Having issues? Roll back instantly: `git checkout v0.2.0 && python setup.py build_ext --inplace`
+Full version details and rollback guide → [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
