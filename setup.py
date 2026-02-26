@@ -25,7 +25,7 @@ KERNEL_DIR = CSRC / "kernels"
 
 # Precision control: ENABLE_BF16=0 for M1 (FP32 fallback), =1 for M4+ (BF16 training)
 METAL_DEFINES = {
-    "ENABLE_BF16": "0",  # Set to "1" when targeting M4/Apple GPU Family 9+
+    "ENABLE_BF16": "1",  # Set to "1" when targeting M4/Apple GPU Family 9+
 }
 
 
@@ -78,16 +78,19 @@ class MetalBuildExt(build_ext):
         for key, val in METAL_DEFINES.items():
             metal_flags.extend(["-D", f"{key}={val}"])
 
+        # Determine MSL version: metal3.2 required for bfloat (M4+)
+        msl_version = "metal3.2" if METAL_DEFINES.get("ENABLE_BF16") == "1" else "metal3.0"
+
         air_files = []
         for metal_file in metal_srcs:
             air_file = metal_file.with_suffix(".air")
-            print(f"  [metal] {metal_file.name} → {air_file.name}")
+            print(f"  [metal] {metal_file.name} → {air_file.name}  (MSL {msl_version})")
             cmd = [
                 "xcrun", "-sdk", "macosx", "metal",
                 "-c", str(metal_file),
                 "-o", str(air_file),
                 "-ffast-math",
-                "-std=metal3.0",
+                "-std=" + msl_version,
             ] + metal_flags
             
             try:
@@ -164,7 +167,7 @@ def build_extension():
 
 setup(
     name="metal-gs",
-    version="0.1.0",
+    version="0.2.0",
     description="Apple Silicon-native Gaussian Splatting operators",
     packages=find_packages(),
     ext_modules=[build_extension()],
