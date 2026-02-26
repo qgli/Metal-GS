@@ -1,0 +1,39 @@
+# Metal-GS v0.2 — Flexible Conda Environment
+# =============================================
+# v0.2 uses PyTorch's PUBLIC Python API only (.cpu().numpy() data bridge).
+# No internal C++ headers are touched, so this version is robust across a
+# wide range of PyTorch releases. Use this if v0.3 fails to compile on your
+# PyTorch version.
+#
+# Usage:
+#   git checkout v0.2.0
+#   conda env create -f environment_v0.2.yml
+#   conda activate metal-gs-v02
+#   python setup.py build_ext --inplace
+#
+# Platform: macOS arm64 (Apple Silicon M1/M2/M3/M4)
+
+name: metal-gs-v02
+channels:
+  - defaults
+
+dependencies:
+  - python>=3.10,<3.13
+  - pip
+  - setuptools
+
+  - pip:
+    # ── Core (loose — public API only, wide compatibility) ─────────
+    - torch>=2.0                # Any MPS-capable PyTorch
+    - numpy>=1.24
+    - pybind11>=2.11
+
+    # ── Training & IO ──────────────────────────────────────────────
+    - pillow>=10.0
+    - plyfile>=1.0
+    - tqdm>=4.60
+    - scipy>=1.10
+
+    # ── Viewer (fully compatible in v0.2) ──────────────────────────
+    - viser>=1.0
+    - trimesh>=4.0

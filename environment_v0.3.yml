@@ -1,0 +1,38 @@
+# Metal-GS v0.3 — Frozen Conda Environment
+# ============================================
+# CRITICAL: v0.3 uses PyTorch's internal C++ MPS API (ATen/mps/MPSStream.h,
+# getMTLBufferStorage). These interfaces are NOT part of PyTorch's public API
+# and may break across versions. This file pins the EXACT versions known to
+# compile and run correctly on Apple Silicon (osx-arm64).
+#
+# Usage:
+#   conda env create -f environment_v0.3.yml
+#   conda activate metal-gs
+#   python setup.py build_ext --inplace
+#
+# Platform: macOS arm64 (Apple Silicon M1/M2/M3/M4)
+
+name: metal-gs
+channels:
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools
+
+  - pip:
+    # ── Core (PINNED — C++ ABI compatibility) ──────────────────────
+    - torch==2.10.0             # MPS internal API: MPSStream, getMTLBufferStorage
+    - numpy==2.2.6
+    - pybind11==3.0.2           # C++ bindings for mps_bindings.cpp
+
+    # ── Training & IO ──────────────────────────────────────────────
+    - pillow>=10.0
+    - plyfile>=1.0
+    - tqdm>=4.60
+    - scipy>=1.10
+
+    # ── Viewer (optional — Viser conflicts with v0.3 MPS queue) ───
+    - viser>=1.0
+    - trimesh>=4.0

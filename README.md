@@ -114,13 +114,12 @@ csrc/kernels/*.metal ── 17 PSOs, AOT-compiled metallib
 
 ---
 
-## Quick Start
+## Installation & Environment
 
 ### Prerequisites
 
 - **macOS 14+ Sonoma** (macOS 13+ minimum, but 14+ recommended for Metal 3.1+ features)
 - **Apple Silicon** (M1/M2/M3/M4 — any variant)
-- **PyTorch 2.1+** (required for MPS stream internals)
 - **Xcode Command Line Tools:**
   ```bash
   xcode-select --install
@@ -135,31 +134,47 @@ csrc/kernels/*.metal ── 17 PSOs, AOT-compiled metallib
   xcrun -sdk macosx metal --version   # Should print Apple metal version 3xxxx+
   ```
 
-### Install for M4 (BF16 enabled, default)
+### Dual-Track Environments
 
-The default configuration has `ENABLE_BF16=1` in `setup.py`, targeting M4+ (Apple GPU Family 9+) with native `bfloat16` hardware. This compiles Metal shaders with MSL 3.2.
+Metal-GS provides two frozen Conda environments. **Choose based on your priorities:**
+
+| | `environment_v0.3.yml` | `environment_v0.2.yml` |
+|---|---|---|
+| **Target** | v0.3.1 (latest) | v0.2.0 (stable) |
+| **PyTorch** | `==2.10.0` (PINNED) | `>=2.0` (flexible) |
+| **PyTorch API surface** | Internal C++ (`MPSStream.h`, `getMTLBufferStorage`) | Public Python only (`.cpu().numpy()`) |
+| **Breakage risk** | ⚠️ High — torch version changes may break compilation | ✅ Low — public API, wide version tolerance |
+| **Performance** | ~25 it/s (M4) | ~11 it/s (M4) |
+| **Viser viewer** | ❌ Conflicts with MPS queue | ✅ Fully compatible |
+
+#### Option A: v0.3.1 — Maximum Performance (⚠️ exact PyTorch version required)
+
+> **WARNING:** v0.3 uses PyTorch's **internal, non-public C++ MPS API** (`ATen/mps/MPSStream.h`, `getMTLBufferStorage()`). These interfaces are NOT part of PyTorch's stability guarantees and may break across versions. The environment file pins the exact `torch==2.10.0` known to compile correctly. **Do not change the PyTorch version.**
 
 ```bash
-# Create environment (conda recommended — do NOT use venv for Metal extensions)
-conda create -n metal-gs python=3.10 -y
+# Create pinned environment
+conda env create -f environment_v0.3.yml
 conda activate metal-gs
-pip install torch numpy pybind11 tqdm Pillow viser plyfile
 
-# Build (AOT-compiles Metal shaders + C++/ObjC++ extension)
-cd Metal-GS
+# Build (M4 with BF16 — default)
 CC=/usr/bin/clang CXX=/usr/bin/clang++ pip install -e . --no-build-isolation
+
+# For M1/M2/M3: edit setup.py, change ENABLE_BF16 from "1" to "0", then build
 ```
 
-### Install for M1/M2/M3 (FP32 only)
+#### Option B: v0.2.0 — Rock-Stable (any recent PyTorch)
 
-M1/M2/M3 chips do not have BF16 hardware. You must change `ENABLE_BF16` to `"0"` before building:
+If v0.3 fails to compile on your PyTorch version, or you need Viser viewer support, use the stable version:
 
 ```bash
-# 1. Edit setup.py: change ENABLE_BF16 from "1" to "0"
-#    This switches Metal Shading Language from metal3.2 → metal3.0
+# Switch to stable version
+git checkout v0.2.0
 
-# 2. Build
-cd Metal-GS
+# Create flexible environment
+conda env create -f environment_v0.2.yml
+conda activate metal-gs-v02
+
+# Build
 CC=/usr/bin/clang CXX=/usr/bin/clang++ pip install -e . --no-build-isolation
 ```
 
