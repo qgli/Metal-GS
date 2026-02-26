@@ -5,32 +5,90 @@ from torch import nn
 from gs.helpers.math import inverse_sigmoid
 from gs.helpers.transforms import quat_to_rot
 
+# UMA Zero-Copy acceleration: single-pass CPU mask computation via direct
+# GPU memory access on Apple Silicon, replacing multiple MPS kernel launches.
+try:
+    from metal_gs._metal_gs_uma import (
+        uma_densification_mask,
+        uma_pruning_mask,
+    )
+    _UMA_AVAILABLE = True
+except ImportError:
+    _UMA_AVAILABLE = False
+
 """
 This module contains helper functions for densifying and pruning Gaussian models. It is not attached as a class method since it required direct access to the optimizer.
 """
 
 def densify(model: GaussianModel, optimizer: torch.optim.Adam, scene_scale: float, gradient_threshold: float, percent_dense: float = 0.01) -> None:
     """
-    Densifies the Gaussian model by cloning and splitting Gaussians based on the gradient magnitude and the size of the Gaussian.
+    Densifies the Gaussian model by cloning and splitting Gaussians based on
+    the gradient magnitude and the size of the Gaussian.
+
+    UMA path: single CPU pass reads gradient + scale buffers via UMA direct
+    memory access, replacing 5 MPS kernel launches (where, exp, max, and, and).
     """
-    gradients = model.mean_gradient_magnitude
-    exceed_gradient_mask = torch.where(gradients > gradient_threshold, True, False).squeeze(1)
-    large_gaussian_mask = (torch.max(model.scaling_activation(model.scales), dim=1).values > percent_dense * scene_scale)
-    clone_mask = torch.logical_and(exceed_gradient_mask, ~large_gaussian_mask)
-    clone_gaussians(model, optimizer, clone_mask)
-    split_mask = torch.logical_and(exceed_gradient_mask, large_gaussian_mask)
-    padded_split_mask = pad_mask(split_mask, model, model.positions.device)
-    split_gaussians(model, optimizer, padded_split_mask)
+    if _UMA_AVAILABLE and model.positions.is_mps:
+        # --- UMA Zero-Copy path ---
+        gradients = model.mean_gradient_magnitude.squeeze(1).contiguous()  # [N] MPS
+        scales = model.scales.data.contiguous()  # [N, 3] MPS (log-space)
+        scale_threshold = percent_dense * scene_scale
+
+        torch.mps.synchronize()  # ensure GPU writes visible to CPU via UMA
+
+        clone_mask, split_mask, _nc, _ns, _ms = uma_densification_mask(
+            gradients, scales, gradient_threshold, scale_threshold
+        )
+
+        # CPU bool masks → MPS device for model parameter indexing
+        device = model.positions.device
+        clone_mask = clone_mask.to(device)
+        clone_gaussians(model, optimizer, clone_mask)
+        split_mask = split_mask.to(device)
+        padded_split_mask = pad_mask(split_mask, model, device)
+        split_gaussians(model, optimizer, padded_split_mask)
+    else:
+        # --- PyTorch fallback path ---
+        gradients = model.mean_gradient_magnitude
+        exceed_gradient_mask = torch.where(gradients > gradient_threshold, True, False).squeeze(1)
+        large_gaussian_mask = (torch.max(model.scaling_activation(model.scales), dim=1).values > percent_dense * scene_scale)
+        clone_mask = torch.logical_and(exceed_gradient_mask, ~large_gaussian_mask)
+        clone_gaussians(model, optimizer, clone_mask)
+        split_mask = torch.logical_and(exceed_gradient_mask, large_gaussian_mask)
+        padded_split_mask = pad_mask(split_mask, model, model.positions.device)
+        split_gaussians(model, optimizer, padded_split_mask)
 
 def prune(model: GaussianModel, optimizer: torch.optim.Adam, scene_scale: float, opacity_threshold: float, screen_size_threshold: float, world_size_threshold_multiplier: float = 0.1) -> None:
     """
-    Prunes the Gaussian model by removing Gaussians based on opacity, screen size and world size.
+    Prunes the Gaussian model by removing Gaussians based on opacity, screen
+    size and world size.
+
+    UMA path: single CPU pass reads opacity logits + scales + screen radii via
+    UMA, applying sigmoid/exp inline. Replaces 6 MPS kernel launches.
     """
-    opacity_mask = model.opacity_activation(model.opacities) < opacity_threshold
-    screen_size_mask = model.max_radii2D > screen_size_threshold
-    world_size_mask = model.scaling_activation(model.scales).max(dim=1).values > world_size_threshold_multiplier * scene_scale
-    final_mask = opacity_mask.squeeze(1).logical_or_(screen_size_mask.squeeze(1).logical_or_(world_size_mask))
-    cull_gaussians(model, optimizer, final_mask)
+    if _UMA_AVAILABLE and model.positions.is_mps:
+        # --- UMA Zero-Copy path ---
+        opacities = model.opacities.data.squeeze(1).contiguous()  # [N] raw logits
+        scales = model.scales.data.contiguous()                   # [N, 3] log-space
+        screen_radii = model.max_radii2D.squeeze(1).contiguous()  # [N]
+        world_threshold = world_size_threshold_multiplier * scene_scale
+
+        torch.mps.synchronize()
+
+        final_mask, _np, _ms = uma_pruning_mask(
+            opacities, scales, screen_radii,
+            opacity_threshold, world_threshold, screen_size_threshold
+        )
+
+        final_mask = final_mask.to(model.positions.device)
+        cull_gaussians(model, optimizer, final_mask)
+    else:
+        # --- PyTorch fallback path ---
+        opacity_mask = model.opacity_activation(model.opacities) < opacity_threshold
+        screen_size_mask = model.max_radii2D > screen_size_threshold
+        world_size_mask = model.scaling_activation(model.scales).max(dim=1).values > world_size_threshold_multiplier * scene_scale
+        final_mask = opacity_mask.squeeze(1).logical_or_(screen_size_mask.squeeze(1).logical_or_(world_size_mask))
+        cull_gaussians(model, optimizer, final_mask)
 
 def prune_opacity_only(model: GaussianModel, optimizer: torch.optim.Adam, opacity_threshold: float) -> None:
     """
