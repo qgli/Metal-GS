@@ -292,6 +292,25 @@ Metal-GS/
 
 ---
 
+## Architecture Notes & Failed Experiments
+
+### ❌ simdgroup_matrix (8×8 MMA) for SH Evaluation
+
+**Attempt:** Use Metal 3.0's `simdgroup_float8x8` matrix multiply-accumulate hardware (Apple GPU Family 9+, M3/M4) to accelerate the Spherical Harmonics forward kernel. Pack 8 Gaussians into MMA tiles via a "diagonal extraction" scheme — compute $D = A \times B$ and read only the diagonal $D_{gg}$ for correct per-Gaussian results.
+
+**Result:** Mathematically correct (all precision tests passed, max error $4.88 \times 10^{-4}$ in FP16 output), but only **~1.07× average speedup** on M4 — effectively no benefit.
+
+**Root cause:** SH evaluation is a **batched per-element dot product** ($\text{result}_c = \sum_k Y_k(\mathbf{d}) \cdot C_{k,c}$), where *both* operands are per-Gaussian. There is no shared matrix across the batch. To fit this into 8×8 MMA, we compute $D_{gg'} = \sum_k Y_k(\mathbf{d}_g) \cdot C_{g',k,c}$ — but only the diagonal ($g = g'$) is needed, wasting **87.5% of the MMA compute** on discarded cross-Gaussian products. The dedicated matrix hardware *is* approximately 8× faster per-operation, but this waste precisely cancels the advantage.
+
+**Takeaway for future SIMD work:**
+- `simdgroup_matrix` excels at **shared-operand** workloads (neural net inference, convolution) where one matrix (e.g., weights) is reused across a batch
+- For per-element independent operations, the scalar 1-thread-per-Gaussian kernel with full ALU utilization remains optimal
+- Better MMA candidates in this codebase: `rasterize.metal` (shared Gaussian data across tile pixels) and `preprocess.metal` (3×3 covariance matrix chains)
+
+**Code reference:** Full implementation, benchmark script, and mathematical analysis archived on branch [`exp/simd-sh-mma`](https://github.com/qgli/Metal-GS/tree/exp/simd-sh-mma).
+
+---
+
 ## Acknowledgements
 
 Metal-GS builds on the work of several excellent open-source projects:
