@@ -44,6 +44,33 @@ static py::tuple py_compute_sh_forward(
     return py::make_tuple(colors_out, elapsed_ms);
 }
 
+// SH forward MMA variant (V1.0 exploration — simdgroup_matrix 8×8)
+static py::tuple py_compute_sh_forward_mma(
+    py::array_t<float, py::array::c_style> directions,
+    py::buffer sh_coeffs_buf,
+    uint32_t N,
+    uint32_t K,
+    uint32_t sh_degree
+)
+{
+    auto dir_info = directions.request();
+    if (dir_info.ndim != 2 || dir_info.shape[1] != 3)
+        throw std::runtime_error("directions must be [N, 3] float32");
+    const float* dir_ptr = static_cast<const float*>(dir_info.ptr);
+
+    auto sh_info = sh_coeffs_buf.request();
+    const uint16_t* sh_ptr = static_cast<const uint16_t*>(sh_info.ptr);
+
+    auto colors_out = py::array_t<uint16_t>({(py::ssize_t)N, (py::ssize_t)3});
+    auto out_info = colors_out.request();
+    uint16_t* out_ptr = static_cast<uint16_t*>(out_info.ptr);
+    std::memset(out_ptr, 0, N * 3 * sizeof(uint16_t));
+
+    double elapsed_ms = metal_compute_sh_forward_mma(dir_ptr, sh_ptr, out_ptr, N, K, sh_degree);
+
+    return py::make_tuple(colors_out, elapsed_ms);
+}
+
 static py::tuple py_preprocess_forward(
     py::array_t<float, py::array::c_style> means3d,
     py::array_t<float, py::array::c_style> scales,
@@ -119,6 +146,15 @@ PYBIND11_MODULE(_metal_gs_core, m) {
           py::arg("K"),
           py::arg("sh_degree"),
           "Compute SH → RGB on Metal GPU.\n"
+          "Returns (colors_uint16[N,3], elapsed_ms).");
+
+    m.def("compute_sh_forward_mma", &py_compute_sh_forward_mma,
+          py::arg("directions"),
+          py::arg("sh_coeffs"),
+          py::arg("N"),
+          py::arg("K"),
+          py::arg("sh_degree"),
+          "Compute SH → RGB using simdgroup_matrix 8×8 MMA (V1.0 exploration).\n"
           "Returns (colors_uint16[N,3], elapsed_ms).");
 
     m.def("preprocess_forward", &py_preprocess_forward,

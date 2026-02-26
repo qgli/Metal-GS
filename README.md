@@ -63,8 +63,9 @@ csrc/metal_wrapper.mm ── ObjC++ dispatch layer
     │  │  @autoreleasepool on all 9 entry points                      │
     │  └──────────────────────────────────────────────────────────────┘
     ▼
-csrc/kernels/*.metal ── 15 PSOs, AOT-compiled metallib
-    ├── sh_forward.metal        SH basis evaluation
+csrc/kernels/*.metal ── 16 PSOs, AOT-compiled metallib
+    ├── sh_forward.metal        SH basis evaluation (scalar, production)
+    ├── sh_simd.metal           SH basis evaluation (simdgroup_matrix 8×8 MMA, V1.0 probe)
     ├── preprocess.metal        3D→2D projection, cov2d, tile bounds
     ├── radix_sort.metal        32-bit radix sort (histogram, scan, scatter)
     ├── tile_binning.metal      Gaussian→tile assignment + tile_range
@@ -214,6 +215,33 @@ loss.backward()
 
 ---
 
+## V1.0 Exploration: SIMD Matrix Instructions (`simdgroup_matrix`)
+
+Metal-GS V1.0 explores Apple GPU Family 9's dedicated matrix multiply hardware (`simdgroup_float8x8`) for accelerating the SH evaluation kernel.
+
+**Approach:** The SH forward computation is a per-Gaussian dot product: $\text{result}_c = \sum_k Y_k(\mathbf{d}) \cdot C_{k,c}$. Since both operands are per-Gaussian (no shared matrix), we pack 8 Gaussians into an 8×8 MMA tile via **diagonal extraction** — the correct results appear on the matrix diagonal, with 87.5% off-diagonal waste.
+
+**Correctness:** ALL PASS — max error 4.88e-04 (within FP16 output quantisation), bit-exact at degree 0–2.
+
+**Performance (M4, SH degree 3):**
+
+| Gaussians | Scalar (ms) | MMA (ms) | Speedup |
+|-----------|-------------|----------|---------|
+| 10K | 0.422 | 0.240 | **1.76×** |
+| 100K | 0.525 | 0.501 | 1.05× |
+| 500K | 2.275 | 2.469 | 0.92× |
+| **Average** | | | **1.07×** |
+
+**Conclusion:** The MMA hardware is indeed ~8× faster per-operation (confirming Apple GPU Family 9 has dedicated matrix units), but the 87.5% off-diagonal waste roughly cancels the hardware advantage. **SH evaluation is not a natural fit for `simdgroup_matrix`** — it's a batched per-element dot product, not a shared-operand matmul.
+
+**V1.0 SIMD Roadmap — better candidates:**
+- ⭐⭐⭐ `rasterize.metal` — shared Gaussian data across pixels in a tile (natural MMA mapping)
+- ⭐⭐ `preprocess.metal` — covariance chain J·R·S·Sᵀ·Rᵀ·Jᵀ (structured 3×3 matmuls)
+
+Full analysis: [docs/SIMD_SH_ANALYSIS.md](docs/SIMD_SH_ANALYSIS.md) · Benchmark report: [docs/reports/SIMD_MMA_BENCHMARK.md](docs/reports/SIMD_MMA_BENCHMARK.md)
+
+---
+
 ## Hardware Tested
 
 | Chip | GPU Cores | Memory | GPU Family | Capping Required | BF16 | Status |
@@ -275,8 +303,8 @@ To use your own data, run COLMAP on your images and place the output in the same
 ```
 Metal-GS/
 ├── csrc/
-│   ├── kernels/          9 Metal shader files → AOT-compiled metallib
-│   ├── metal_wrapper.mm  ObjC++ dispatch layer (9 public functions)
+│   ├── kernels/          10 Metal shader files → AOT-compiled metallib
+│   ├── metal_wrapper.mm  ObjC++ dispatch layer (10 public functions)
 │   ├── metal_wrapper.h   C++ header
 │   └── bindings.cpp      PyBind11 bindings
 ├── metal_gs/

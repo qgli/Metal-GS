@@ -1,0 +1,24 @@
+V1.0 Probe: simdgroup_matrix 8x8 MMA for SH evaluation
+
+SIMD Exploration (sh_simd.metal):
+- Implemented simdgroup_float8x8 MMA kernel with diagonal extraction
+- 8 Gaussians packed per simdgroup, correct results on matrix diagonal
+- Feature guard with scalar fallback for M1/M2
+
+Benchmark Results (M4, SH degree 3, 16 bases):
+- Correctness: ALL PASS (max err 4.88e-04, within FP16 quantisation)
+- Performance: 1.07x average (MMA ~= scalar), 1.76x peak at N=10K
+- 87.5% off-diagonal waste cancels ~8x MMA hardware advantage
+- Conclusion: SH eval not a natural MMA fit; focus on rasterize/preprocess
+
+Files added:
+- csrc/kernels/sh_simd.metal         MMA kernel + scalar fallback
+- benchmark_simd_sh.py               Correctness + performance benchmark
+- docs/SIMD_SH_ANALYSIS.md           Mathematical analysis
+- docs/reports/SIMD_MMA_BENCHMARK.md Full benchmark report
+
+Files modified:
+- csrc/metal_wrapper.mm  Added sh_fwd_mma_pso (16 PSOs total)
+- csrc/metal_wrapper.h   Added metal_compute_sh_forward_mma()
+- csrc/bindings.cpp      Added compute_sh_forward_mma binding
+- README.md              SIMD exploration section + updated counts

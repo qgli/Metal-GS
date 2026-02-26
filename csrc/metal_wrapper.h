@@ -14,6 +14,18 @@ double metal_compute_sh_forward(
     uint32_t        sh_degree
 );
 
+// Compute SH forward pass using simdgroup_matrix MMA (V1.0 exploration).
+// Identical interface to metal_compute_sh_forward, different dispatch grid.
+// Returns elapsed time in ms, or -1.0 on error.
+double metal_compute_sh_forward_mma(
+    const float*    directions,     // [N, 3]  FP32
+    const uint16_t* sh_coeffs,      // [N, K, 3]  FP16 (as raw uint16 bits)
+    uint16_t*       colors_out,     // [N, 3]  FP16 (as raw uint16 bits)
+    uint32_t        N,
+    uint32_t        K,
+    uint32_t        sh_degree
+);
+
 // Preprocess 3D Gaussians to 2D screen space.
 // Returns elapsed time in ms, or -1.0 on error.
 double metal_preprocess_forward(

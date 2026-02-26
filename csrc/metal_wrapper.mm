@@ -105,6 +105,8 @@ struct MetalContext {
     // Simple KNN PSOs
     id<MTLComputePipelineState> morton_codes_pso  = nil;
     id<MTLComputePipelineState> knn_search_pso    = nil;
+    // SIMD MMA exploration PSO (v1.0)
+    id<MTLComputePipelineState> sh_fwd_mma_pso   = nil;
     bool                        initialised      = false;
     std::string                 error_msg;
 };
@@ -227,8 +229,9 @@ bool ensure_init() {
         c.sh_bw_pso         = make_pso("sh_backward");         if (!c.sh_bw_pso)         return false;
         c.morton_codes_pso  = make_pso("compute_morton_codes"); if (!c.morton_codes_pso)  return false;
         c.knn_search_pso    = make_pso("knn_search");           if (!c.knn_search_pso)    return false;
+        c.sh_fwd_mma_pso    = make_pso("compute_sh_forward_mma"); if (!c.sh_fwd_mma_pso) return false;
 
-        fprintf(stderr, "[Metal-GS] All 15 PSOs created successfully\n");
+        fprintf(stderr, "[Metal-GS] All 16 PSOs created successfully\n");
 
         c.initialised = true;
         return true;
@@ -323,6 +326,94 @@ double metal_compute_sh_forward(
         // Copy result
         memcpy(colors_out, [out_buf contents], out_bytes);
 
+        return elapsed_ms;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  SH forward MMA variant — simdgroup_matrix 8×8 (V1.0 exploration)
+//  Identical interface to metal_compute_sh_forward but dispatches the MMA kernel.
+//  Thread model: 8 Gaussians per simdgroup, 64 per threadgroup (256 threads).
+// ---------------------------------------------------------------------------
+double metal_compute_sh_forward_mma(
+    const float*    directions,
+    const uint16_t* sh_coeffs,
+    uint16_t*       colors_out,
+    uint32_t        N,
+    uint32_t        K,
+    uint32_t        sh_degree
+)
+{
+    @autoreleasepool {
+        if (!ensure_init()) {
+            fprintf(stderr, "[Metal-GS] Init failed: %s\n", ctx().error_msg.c_str());
+            return -1.0;
+        }
+
+        MetalContext& c = ctx();
+
+        size_t dir_buf_bytes = (size_t)N * sizeof(float) * 4;
+        size_t sh_bytes      = (size_t)N * K * 3 * sizeof(uint16_t);
+        size_t out_bytes     = (size_t)N * 3 * sizeof(uint16_t);
+
+        id<MTLBuffer> dir_buf   = [c.device newBufferWithLength:dir_buf_bytes
+                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sh_buf    = [c.device newBufferWithBytes:(const void*)sh_coeffs
+                                            length:sh_bytes
+                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf   = [c.device newBufferWithLength:out_bytes
+                                            options:MTLResourceStorageModeShared];
+
+        SHParams params = { N, K, sh_degree };
+        id<MTLBuffer> param_buf = [c.device newBufferWithBytes:&params
+                                             length:sizeof(SHParams)
+                                             options:MTLResourceStorageModeShared];
+
+        float* dir_dst = (float*)[dir_buf contents];
+        for (uint32_t i = 0; i < N; i++) {
+            dir_dst[i * 4 + 0] = directions[i * 3 + 0];
+            dir_dst[i * 4 + 1] = directions[i * 3 + 1];
+            dir_dst[i * 4 + 2] = directions[i * 3 + 2];
+            dir_dst[i * 4 + 3] = 0.0f;
+        }
+
+        id<MTLCommandBuffer>         cmd = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        [enc setComputePipelineState:c.sh_fwd_mma_pso];
+        [enc setBuffer:dir_buf   offset:0 atIndex:0];
+        [enc setBuffer:sh_buf    offset:0 atIndex:1];
+        [enc setBuffer:out_buf   offset:0 atIndex:2];
+        [enc setBuffer:param_buf offset:0 atIndex:3];
+
+        // MMA thread model: 64 Gaussians per threadgroup (8 simdgroups × 8 each)
+        NSUInteger tg_size = 256;
+        NSUInteger gaussians_per_tg = 64;
+        uint32_t num_tgs = (N + (uint32_t)gaussians_per_tg - 1) / (uint32_t)gaussians_per_tg;
+        MTLSize tg_count = MTLSizeMake(num_tgs, 1, 1);
+        MTLSize tg_dim   = MTLSizeMake(tg_size, 1, 1);
+
+        [enc dispatchThreadgroups:tg_count threadsPerThreadgroup:tg_dim];
+        [enc endEncoding];
+
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        uint64_t t0 = mach_absolute_time();
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        uint64_t t1 = mach_absolute_time();
+        double elapsed_ns = (double)(t1 - t0) * tb.numer / tb.denom;
+        double elapsed_ms = elapsed_ns / 1e6;
+
+        if ([cmd status] == MTLCommandBufferStatusError) {
+            fprintf(stderr, "[Metal-GS] MMA Command buffer error: %s\n",
+                    [[cmd.error localizedDescription] UTF8String]);
+            return -1.0;
+        }
+
+        memcpy(colors_out, [out_buf contents], out_bytes);
         return elapsed_ms;
     }
 }
