@@ -8,11 +8,11 @@ Metal-GS is a fully differentiable 3D Gaussian Splatting renderer that runs enti
 
 ### Versions & Rollback
 
-| Tag | Speed | Stability | Best For |
-|-----|-------|-----------|----------|
-| **`v0.3.1`** (latest) | ~25 it/s | Aggressive | M4 max performance |
-| **`v0.2.0`** | ~11 it/s | Rock-stable | Production, Viser UI |
-| **`v0.1.0`** | ~6 it/s | Legacy | M1/M2 compatibility |
+| Tag | Speed (M4) | Speed (M1) | Stability | Best For |
+|-----|------------|------------|-----------|----------|
+| **`v0.3.1`** (latest) | ~25 it/s | ~8.8 it/s | Aggressive | Max performance |
+| **`v0.2.0`** | ~11 it/s | — | Rock-stable | Production, Viser UI |
+| **`v0.1.0`** | ~6 it/s | ~5.3 it/s | Legacy | Fallback only |
 
 Having issues? Roll back instantly: `git checkout v0.2.0 && python setup.py build_ext --inplace`
 Full version details and rollback guide → [CHANGELOG.md](CHANGELOG.md)
@@ -254,13 +254,22 @@ loss.backward()
 | Cat (COLMAP) | 165K | 516×344 (2x) | BF16 | 1024 | ~10.7 it/s | 0.130 |
 | Cat (COLMAP) | 165K | 516×344 (2x) | BF16 | 0 (∞) | ~11.3 it/s | 0.139 |
 
-### v0.1 — M1 7-core GPU, 16GB
+### v0.3.1 — M1 7-core GPU, 16GB
+
+| Dataset | Points | Resolution | Precision | Cap | Speed | vs v0.1 |
+|---|---|---|---|---|---|---|
+| Cat (COLMAP) | 165K | 516×344 (2x) | FP32 | 1024 | **~8.8 it/s** | +64% |
+| Cat (COLMAP) | 165K | 1032×688 (1x) | FP32 | 1024 | **~3.7 it/s** | +39% |
+
+Key timing (2x downsample): fwd 23ms (−43%), bwd 73ms (−42%), optimizer 16ms (unchanged).
+
+### v0.1 (legacy) — M1 7-core GPU, 16GB
 
 | Dataset | Points | Resolution | Precision | Cap | Speed | Final Loss |
 |---|---|---|---|---|---|---|
-| Cat (COLMAP) | 165K | 516×344 (2x) | FP32 | 1024 | ~2.6 it/s | 0.094 |
+| Cat (COLMAP) | 165K | 516×344 (2x) | FP32 | 1024 | ~5.3 it/s | 0.094 |
 
-> **v0.3 is 2.5× faster than v0.2 and ~10× faster than v0.1**, with identical mathematical precision. The speedup comes entirely from eliminating CPU↔GPU synchronization — the GPU kernels themselves are unchanged.
+> **v0.3 on M4 is 2.5× faster than v0.2 and ~5× faster than v0.1.** On M1, v0.3.1 delivers **+39%–64% over v0.1** despite the 7-core GPU's limited bandwidth. The speedup comes entirely from eliminating CPU↔GPU synchronization — the GPU kernels are unchanged. Full M1 benchmark details and comparison report: [`exp/v0.3.1-m1-test`](https://github.com/qgli/Metal-GS/tree/exp/v0.3.1-m1-test).
 
 ---
 
@@ -268,7 +277,7 @@ loss.backward()
 
 | Chip | GPU Cores | Memory | GPU Family | Capping Required | BF16 | Status |
 |---|---|---|---|---|---|---|
-| **M1 (7-core)** | 7 | 16GB | Apple 7 | ✅ Yes (1024) | ❌ | ✅ **Tested (v0.1)** |
+| **M1 (7-core)** | 7 | 16GB | Apple 7 | ✅ Yes (1024) | ❌ | ✅ **Tested (v0.3.1)** |
 | M1 Pro/Max/Ultra | 16–64 | 32–192GB | Apple 7 | ✅ Yes (1024–4096) | ❌ | 🔜 Same ISA, needs cap |
 | M2 family | 8–38 | 8–192GB | Apple 8 | ✅ Yes (1024–4096) | ❌ | 🔜 Same ISA, needs cap |
 | M3 family | 10–40 | 8–128GB | **Apple 9** | ❌ Dynamic Caching | ❌ | 🔜 Cap=0 safe |
@@ -288,7 +297,7 @@ loss.backward()
 - **⚠️ Viser real-time viewer crashes training (v0.3):** The v0.3 MPS Custom Op pipeline monopolizes PyTorch's GPU command queue. When Viser's rendering loop submits concurrent Metal work, the two compete for the same queue, causing GPU contention crashes. **Workaround:** Set `use_viewer=False` in `example.py`. Headless training is fully stable. This is a known limitation of sharing PyTorch's MPS stream with external Metal consumers.
 - **No multi-GPU:** Metal-GS targets single-GPU Apple Silicon. Multi-GPU (Mac Pro with multiple M2 Ultra) is not supported.
 - **FP32 only on M1/M2/M3:** BF16 requires Apple GPU Family 9+ (M4). M1/M2/M3 run all kernels in FP32.
-- **M1/M2 backward compatibility:** v0.3 uses `ATen/mps/MPSStream.h` (PyTorch 2.1+ required). The MPS backend on M1 is expected to be functional but has not been re-tested with v0.3. The single sync point in the forward pass may have different performance characteristics on M1's 7-core GPU.
+- **M1/M2 backward compatibility:** v0.3.1 has been verified on M1 (7-core, 16GB) with PyTorch 2.10.0. Requires `ENABLE_BF16=0` and `max_gaussians_per_tile=1024`. See branch [`exp/v0.3.1-m1-test`](https://github.com/qgli/Metal-GS/tree/exp/v0.3.1-m1-test) for M1-specific build adaptations and benchmark scripts.
 - **Densification scale:** The bundled minGS trainer uses a simplified densification schedule (30 iterations). For production quality, increase `densify_until_iter`.
 
 ---
