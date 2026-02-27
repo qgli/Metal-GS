@@ -295,15 +295,36 @@ loss.backward()
 
 ## Dataset
 
-Metal-GS ships with a COLMAP-processed cat dataset (179 frames, 165K points) for quick testing.
+Metal-GS ships with a COLMAP-processed cat dataset (179 frames, 165K points, 1032×688 resolution) for quick testing.
 
-**Download:** The dataset will be available on [Google Drive](https://drive.google.com/) (link coming soon).
+### Download
+
+The dataset is hosted on Google Drive:
+
+📦 **[cat.zip on Google Drive](https://drive.google.com/drive/folders/1vmGAbOf69MsX1B6osLks0pNLfxsUDClQ?usp=drive_link)** (~83 MB)
+
+Download `cat.zip` from the link above, then run:
+
+```bash
+# From the Metal-GS root directory:
+unzip cat.zip -d .
+
+# Verify the structure
+ls minGS/data/cat/images/ | wc -l    # Should print 179
+ls minGS/data/cat/sparse/0/          # Should contain cameras.bin, images.bin, points3D.bin, points3D.ply
+
+# (Optional) Clean up macOS hidden files if present
+find minGS/data/cat -name '.DS_Store' -delete
+rm -rf minGS/data/cat/__MACOSX
+```
+
+> **Note:** The zip contains only the low-resolution training images (1032×688) and COLMAP sparse model — no raw camera originals. It extracts directly into `minGS/data/cat/` with the correct directory structure. After extraction, you can immediately run `cd minGS && python example.py`.
 
 ### Expected COLMAP Directory Structure
 
 ```
-data/cat/
-├── images/                   # 179 source images (frame_00001.JPG … frame_00179.JPG)
+minGS/data/cat/
+├── images/                   # 179 training images (1032×688, ~43 MB total)
 │   ├── frame_00001.JPG
 │   ├── frame_00002.JPG
 │   └── ...
@@ -311,7 +332,7 @@ data/cat/
     └── 0/
         ├── cameras.bin       # Camera intrinsics (COLMAP format)
         ├── images.bin        # Camera extrinsics (COLMAP format)
-        ├── points3D.bin      # 3D point cloud (COLMAP format)
+        ├── points3D.bin      # 3D point cloud (165K points, COLMAP format)
         └── points3D.ply      # Point cloud in PLY format (optional)
 ```
 
